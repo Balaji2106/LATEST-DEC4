@@ -1,3 +1,5 @@
 aiops-proj-env
 .env
 .env
+.env
+genai_rca_assistant/.env

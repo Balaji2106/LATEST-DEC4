@@ -505,7 +505,7 @@ def log_audit(ticket_id: str, action: str, pipeline: str = None, run_id: str = N
     except Exception as e:
         logger.error(f"Failed to log audit: {e}")
 
-# --- Blob Upload Helper Function ---
+# --- Blob Upload Helper Functions ---
 def upload_payload_to_blob(ticket_id: str, payload: dict) -> Optional[str]:
     """Uploads the raw payload to Azure Blob Storage and logs to audit trail."""
     if not (blob_service_client and AZURE_BLOB_ENABLED):
@@ -523,6 +523,44 @@ def upload_payload_to_blob(ticket_id: str, payload: dict) -> Optional[str]:
     except Exception as e:
         logger.error(f"Failed to upload blob for %s: %s", ticket_id, e)
         log_audit(ticket_id=ticket_id, action="Blob Upload Failed", details=str(e))
+        return None
+
+
+def upload_databricks_logs_to_blob(ticket_id: str, run_details: dict, webhook_payload: dict) -> Optional[str]:
+    """
+    Uploads Databricks run details and webhook payload to Azure Blob Storage.
+    Stores both the raw webhook payload and detailed run information from Databricks API.
+    """
+    if not (blob_service_client and AZURE_BLOB_ENABLED):
+        return None
+    try:
+        # Create combined payload with both webhook and API details
+        combined_payload = {
+            "ticket_id": ticket_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "source": "databricks",
+            "webhook_payload": webhook_payload,
+            "run_details_from_api": run_details,
+            "metadata": {
+                "job_id": run_details.get("job_id") if run_details else None,
+                "run_id": run_details.get("run_id") if run_details else None,
+                "cluster_id": run_details.get("cluster_instance", {}).get("cluster_id") if run_details else None,
+            }
+        }
+
+        blob_name = f"{datetime.utcnow().strftime('%Y-%m-%d')}/{ticket_id}-databricks-logs.json"
+        blob_client = blob_service_client.get_blob_client(container=AZURE_BLOB_CONTAINER_NAME, blob=blob_name)
+        payload_bytes = json.dumps(combined_payload, indent=2).encode('utf-8')
+        with BytesIO(payload_bytes) as data_stream:
+            blob_client.upload_blob(data_stream, overwrite=True)
+        url = blob_client.url
+        logger.info("Uploaded Databricks logs for %s to blob: %s", ticket_id, url)
+        log_audit(ticket_id=ticket_id, action="Databricks Logs Saved to Blob",
+                 details=f"Databricks run details and logs saved to: {url}")
+        return url
+    except Exception as e:
+        logger.error(f"Failed to upload Databricks logs for %s: %s", ticket_id, e)
+        log_audit(ticket_id=ticket_id, action="Databricks Blob Upload Failed", details=str(e))
         return None
 
 def extract_finops_tags(resource_name: str, resource_type: str = "adf"):
@@ -584,7 +622,7 @@ AuthenticationError, ThrottlingError, UnknownError]"""
     service_prefixed_desc = f"[{service_name.upper()}] {description}"
 
     prompt = f"""
-You are an expert AIOps Root Cause Analysis assistant for {service_name}.
+You are an expert AIOps Root Cause Analysis assistant for {service_name} with STRICT auto-remediation decision-making capabilities.
 
 CRITICAL: This error is from {service_name.upper()}, NOT from any other Azure service.
 DO NOT mention Azure Data Factory if this is a Databricks error.
@@ -604,7 +642,13 @@ Return a STRICT JSON in this format (NO markdown, NO extra text):
   "priority": "P1|P2|P3|P4",
   "confidence": "Very High|High|Medium|Low",
   "recommendations": ["Step 1: ...", "Step 2: ...", "Step 3: ..."],
-  "auto_heal_possible": true|false
+  "auto_heal_possible": true|false,
+  "is_auto_remediable": true|false,
+  "remediation_action": "retry_pipeline|restart_cluster|retry_job|reinstall_libraries|check_upstream|manual_intervention",
+  "remediation_risk": "Low|Medium|High",
+  "requires_human_approval": true|false,
+  "business_impact": "Low|Medium|High|Critical",
+  "estimated_resolution_time_minutes": 5
 }}
 
 Severity Guidelines:
@@ -619,9 +663,63 @@ Priority Guidelines:
 - P3: Fix within 2 hours - Medium severity
 - P4: Fix within 24 hours - Low severity
 
-IMPORTANT: In your root_cause, explicitly mention "{service_name}" (not any other service).
-Analyze logically - don't invent details. Use only what's in the message.
-Be specific about the affected entity (cluster name, job name, table name, etc.)
+AUTO-REMEDIATION DECISION RULES (MUST FOLLOW STRICTLY):
+
+1. **is_auto_remediable = true** ONLY IF:
+   - Error is transient (network timeout, gateway error, connection failed, throttling)
+   - Error is infrastructure-related (cluster start failure, resource exhaustion, library installation)
+   - Error has deterministic fix (retry, restart, reinstall)
+   - NO data loss risk
+   - NO security implications
+   - NO production data corruption risk
+
+2. **is_auto_remediable = false** (REQUIRES MANUAL) IF:
+   - Data quality issues (schema mismatch, invalid data, column errors)
+   - Business logic errors
+   - Permission/authentication errors (may need IAM changes)
+   - Source data missing/not available yet
+   - Configuration errors requiring code changes
+   - ANY uncertainty about root cause
+
+3. **remediation_action** - Choose ONLY from:
+   - retry_pipeline: For transient ADF failures (timeout, connection, throttling)
+   - restart_cluster: For Databricks cluster failures
+   - retry_job: For Databricks job execution transient failures
+   - reinstall_libraries: For library installation issues
+   - check_upstream: For missing source data (wait for upstream)
+   - manual_intervention: For everything else
+
+4. **remediation_risk**:
+   - Low: Simple retry, no side effects (network errors, timeouts)
+   - Medium: Restart operations, resource allocation changes
+   - High: Data operations, multi-service dependencies
+
+5. **requires_human_approval = true** IF:
+   - remediation_risk is "High"
+   - severity is "Critical"
+   - business_impact is "Critical" or "High"
+   - Affects production financial/customer data
+   - Multiple failed remediation attempts already occurred
+   - Uncertainty in root cause (confidence is "Low")
+
+6. **business_impact**:
+   - Critical: Customer-facing, revenue-impacting, SLA-breach
+   - High: Internal critical workflows blocked
+   - Medium: Partial feature degradation
+   - Low: Non-critical background jobs
+
+7. **estimated_resolution_time_minutes**:
+   - Retry operations: 2-5 minutes
+   - Restart cluster: 5-10 minutes
+   - Library reinstall: 10-15 minutes
+   - Manual intervention: 30+ minutes
+
+IMPORTANT:
+- Be STRICT - when in doubt, set is_auto_remediable = false
+- ALWAYS provide remediation_action even if not auto-remediable
+- In your root_cause, explicitly mention "{service_name}" (not any other service)
+- Analyze logically - don't invent details. Use only what's in the message
+- Be specific about the affected entity (cluster name, job name, table name, etc.)
 
 Error Message:
 \"\"\"{service_prefixed_desc}\"\"\"
@@ -660,7 +758,7 @@ AuthenticationError, ThrottlingError, UnknownError]"""
     service_prefixed_desc = f"[{service_name.upper()}] {description}"
 
     prompt = f"""
-You are an expert AIOps Root Cause Analysis assistant for {service_name}.
+You are an expert AIOps Root Cause Analysis assistant for {service_name} with STRICT auto-remediation decision-making capabilities.
 
 CRITICAL: This error is from {service_name.upper()}, NOT from any other Azure service.
 DO NOT mention Azure Data Factory if this is a Databricks error.
@@ -680,7 +778,13 @@ Return a STRICT JSON in this format (NO markdown, NO extra text, NO thinking tag
   "priority": "P1|P2|P3|P4",
   "confidence": "Very High|High|Medium|Low",
   "recommendations": ["Step 1: ...", "Step 2: ...", "Step 3: ..."],
-  "auto_heal_possible": true|false
+  "auto_heal_possible": true|false,
+  "is_auto_remediable": true|false,
+  "remediation_action": "retry_pipeline|restart_cluster|retry_job|reinstall_libraries|check_upstream|manual_intervention",
+  "remediation_risk": "Low|Medium|High",
+  "requires_human_approval": true|false,
+  "business_impact": "Low|Medium|High|Critical",
+  "estimated_resolution_time_minutes": 5
 }}
 
 Severity Guidelines:
@@ -695,9 +799,63 @@ Priority Guidelines:
 - P3: Fix within 2 hours - Medium severity
 - P4: Fix within 24 hours - Low severity
 
-IMPORTANT: In your root_cause, explicitly mention "{service_name}" (not any other service).
-Analyze logically - don't invent details. Use only what's in the message.
-Be specific about the affected entity (cluster name, job name, table name, etc.)
+AUTO-REMEDIATION DECISION RULES (MUST FOLLOW STRICTLY):
+
+1. **is_auto_remediable = true** ONLY IF:
+   - Error is transient (network timeout, gateway error, connection failed, throttling)
+   - Error is infrastructure-related (cluster start failure, resource exhaustion, library installation)
+   - Error has deterministic fix (retry, restart, reinstall)
+   - NO data loss risk
+   - NO security implications
+   - NO production data corruption risk
+
+2. **is_auto_remediable = false** (REQUIRES MANUAL) IF:
+   - Data quality issues (schema mismatch, invalid data, column errors)
+   - Business logic errors
+   - Permission/authentication errors (may need IAM changes)
+   - Source data missing/not available yet
+   - Configuration errors requiring code changes
+   - ANY uncertainty about root cause
+
+3. **remediation_action** - Choose ONLY from:
+   - retry_pipeline: For transient ADF failures (timeout, connection, throttling)
+   - restart_cluster: For Databricks cluster failures
+   - retry_job: For Databricks job execution transient failures
+   - reinstall_libraries: For library installation issues
+   - check_upstream: For missing source data (wait for upstream)
+   - manual_intervention: For everything else
+
+4. **remediation_risk**:
+   - Low: Simple retry, no side effects (network errors, timeouts)
+   - Medium: Restart operations, resource allocation changes
+   - High: Data operations, multi-service dependencies
+
+5. **requires_human_approval = true** IF:
+   - remediation_risk is "High"
+   - severity is "Critical"
+   - business_impact is "Critical" or "High"
+   - Affects production financial/customer data
+   - Multiple failed remediation attempts already occurred
+   - Uncertainty in root cause (confidence is "Low")
+
+6. **business_impact**:
+   - Critical: Customer-facing, revenue-impacting, SLA-breach
+   - High: Internal critical workflows blocked
+   - Medium: Partial feature degradation
+   - Low: Non-critical background jobs
+
+7. **estimated_resolution_time_minutes**:
+   - Retry operations: 2-5 minutes
+   - Restart cluster: 5-10 minutes
+   - Library reinstall: 10-15 minutes
+   - Manual intervention: 30+ minutes
+
+IMPORTANT:
+- Be STRICT - when in doubt, set is_auto_remediable = false
+- ALWAYS provide remediation_action even if not auto-remediable
+- In your root_cause, explicitly mention "{service_name}" (not any other service)
+- Analyze logically - don't invent details. Use only what's in the message
+- Be specific about the affected entity (cluster name, job name, table name, etc.)
 
 Error Message:
 \"\"\"{service_prefixed_desc}\"\"\"
@@ -773,7 +931,13 @@ def fallback_rca(desc: str, source_type: str = "adf"):
         "priority": "P3",
         "confidence": "Low",
         "recommendations": [f"Inspect {source_type.upper()} logs for more context.", "Check resource health and configurations."],
-        "auto_heal_possible": False
+        "auto_heal_possible": False,
+        "is_auto_remediable": False,
+        "remediation_action": "manual_intervention",
+        "remediation_risk": "High",
+        "requires_human_approval": True,
+        "business_impact": "Medium",
+        "estimated_resolution_time_minutes": 30
     }
 
 def generate_rca_and_recs(desc, source_type="adf"):
@@ -1175,6 +1339,121 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
         return {"success": False, "message": str(e)}
 
 
+async def trigger_databricks_remediation(ticket_id: str, job_name: str, job_id: str,
+                                          cluster_id: str, run_id: str, error_type: str,
+                                          attempt_number: int = 1):
+    """
+    Triggers Databricks auto-remediation via Azure Logic App
+    Returns: dict with success status and remediation_run_id
+    """
+    logger.info(f"[AUTO-REM-DBX] Triggering Databricks remediation for {ticket_id}, error: {error_type}, attempt: {attempt_number}")
+
+    # Check if error is remediable
+    if error_type not in REMEDIABLE_ERRORS:
+        logger.info(f"[AUTO-REM-DBX] Error type {error_type} is not auto-remediable")
+        return {"success": False, "message": "Error type not remediable"}
+
+    remediation_config = REMEDIABLE_ERRORS[error_type]
+
+    # Check retry limits
+    if attempt_number > remediation_config["max_retries"]:
+        logger.warning(f"[AUTO-REM-DBX] Max retries ({remediation_config['max_retries']}) exceeded for {ticket_id}")
+        return {"success": False, "message": "Max retries exceeded"}
+
+    # Get playbook URL (Databricks Logic App)
+    playbook_url = remediation_config["playbook_url"]
+    if not playbook_url:
+        logger.error(f"[AUTO-REM-DBX] No playbook URL configured for {error_type}")
+        return {"success": False, "message": "Playbook URL not configured"}
+
+    # Calculate backoff delay
+    if attempt_number > 1:
+        backoff_index = attempt_number - 2
+        if backoff_index < len(remediation_config["backoff_seconds"]):
+            delay = remediation_config["backoff_seconds"][backoff_index]
+            logger.info(f"[AUTO-REM-DBX] Waiting {delay}s before retry attempt {attempt_number}")
+            await asyncio.sleep(delay)
+
+    # Prepare payload for Databricks Logic App
+    payload = {
+        "job_name": job_name,
+        "job_id": str(job_id) if job_id else None,
+        "cluster_id": cluster_id,
+        "ticket_id": ticket_id,
+        "error_type": error_type,
+        "original_run_id": run_id,
+        "retry_attempt": attempt_number,
+        "max_retries": remediation_config["max_retries"],
+        "remediation_action": remediation_config["action"],
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        # Call Databricks Logic App
+        response = _http_post_with_retries(playbook_url, payload, timeout=30, retries=3)
+
+        if response and response.status_code == 200:
+            response_data = response.json()
+            remediation_run_id = response_data.get("run_id", "N/A")
+
+            # Store remediation attempt
+            db_execute('''INSERT INTO remediation_attempts
+                        (ticket_id, original_run_id, remediation_run_id, attempt_number,
+                         status, error_type, remediation_action, logic_app_response, started_at)
+                        VALUES (:ticket_id, :original_run_id, :remediation_run_id, :attempt_number,
+                         :status, :error_type, :remediation_action, :logic_app_response, :started_at)''',
+                     {"ticket_id": ticket_id, "original_run_id": run_id, "remediation_run_id": remediation_run_id,
+                      "attempt_number": attempt_number, "status": "in_progress", "error_type": error_type,
+                      "remediation_action": remediation_config["action"], "logic_app_response": json.dumps(response_data),
+                      "started_at": datetime.now(timezone.utc).isoformat()})
+
+            # Update ticket
+            db_execute('''UPDATE tickets
+                        SET remediation_status = :status,
+                            remediation_run_id = :run_id,
+                            remediation_attempts = :attempts,
+                            remediation_last_attempt_at = :last_attempt
+                        WHERE id = :id''',
+                     {"status": "in_progress", "run_id": remediation_run_id, "attempts": attempt_number,
+                      "last_attempt": datetime.now(timezone.utc).isoformat(), "id": ticket_id})
+
+            # Log audit trail
+            log_audit(
+                ticket_id=ticket_id, action="databricks_remediation_triggered", pipeline=job_name,
+                run_id=remediation_run_id, user_name="AI_AUTO_HEAL_DBX", user_empid="AUTO_REM_DBX_001",
+                details=json.dumps({"attempt": attempt_number, "action": remediation_config["action"], "error_type": error_type, "cluster_id": cluster_id})
+            )
+
+            logger.info(f"[AUTO-REM-DBX] Successfully triggered for {ticket_id}, remediation_run_id: {remediation_run_id}")
+
+            # Send Slack notification
+            await send_slack_remediation_started(ticket_id, job_name, attempt_number, remediation_config["max_retries"])
+
+            # Broadcast to dashboard
+            try:
+                await manager.broadcast({
+                    "event": "remediation_started",
+                    "ticket_id": ticket_id,
+                    "attempt": attempt_number,
+                    "remediation_run_id": remediation_run_id
+                })
+            except Exception:
+                pass
+
+            # Note: Databricks job monitoring would need Databricks API polling (not ADF API)
+            # For now, we'll rely on subsequent webhook callbacks from Databricks
+            # You could implement a similar monitoring task using Databricks Jobs API
+
+            return {"success": True, "remediation_run_id": remediation_run_id}
+        else:
+            logger.error(f"[AUTO-REM-DBX] Logic App returned error: {response.status_code if response else 'No response'}")
+            return {"success": False, "message": f"Logic App error: {response.status_code if response else 'No response'}"}
+
+    except Exception as e:
+        logger.exception(f"[AUTO-REM-DBX] Error triggering Databricks remediation: {e}")
+        return {"success": False, "message": str(e)}
+
+
 async def monitor_remediation_run(ticket_id: str, pipeline_name: str,
                                     remediation_run_id: str, original_run_id: str,
                                     error_type: str, attempt_number: int):
@@ -1400,32 +1679,36 @@ async def handle_max_retries_exceeded(ticket_id: str, pipeline_name: str,
                                         error_type: str, failure_reason: str):
     """
     Called when all retry attempts exhausted
+    Marks ticket as "auto remediation applied but not solved"
     Escalates to manual intervention
     """
-    logger.error(f"[AUTO-REM] Max retries exceeded for {ticket_id}, escalating to manual intervention")
+    logger.error(f"[AUTO-REM] Max retries exceeded for {ticket_id}, marking as 'auto remediation applied but not solved'")
 
     now = datetime.now(timezone.utc).isoformat()
 
-    # Update ticket
+    # Update ticket with new status indicating remediation was attempted but failed
     db_execute('''UPDATE tickets
                 SET remediation_status = :status,
-                    status = :ticket_status
+                    status = :ticket_status,
+                    remediation_exhausted_at = :exhausted_at
                 WHERE id = :id''',
-             {"status": "max_retries_exceeded", "ticket_status": "open", "id": ticket_id})
+             {"status": "applied_not_solved", "ticket_status": "in_progress", "exhausted_at": now, "id": ticket_id})
 
     # Get ticket details
     row = db_query("SELECT * FROM tickets WHERE id = :id", {"id": ticket_id}, one=True)
     if not row:
         return
 
-    # Log audit trail
+    # Log audit trail with new status
     log_audit(
-        ticket_id=ticket_id, action="auto_remediation_max_retries_exceeded", pipeline=pipeline_name,
+        ticket_id=ticket_id, action="auto_remediation_applied_but_not_solved", pipeline=pipeline_name,
         user_name="AI_AUTO_HEAL", user_empid="AUTO_REM_001",
         details=json.dumps({
             "error_type": error_type,
             "failure_reason": failure_reason,
-            "attempts": row.get('remediation_attempts', 0)
+            "attempts": row.get('remediation_attempts', 0),
+            "status": "Auto-remediation applied but issue not resolved after all retry attempts",
+            "next_action": "Manual intervention required"
         }),
         itsm_ticket_id=row.get("itsm_ticket_id")
     )
@@ -1437,14 +1720,16 @@ async def handle_max_retries_exceeded(ticket_id: str, pipeline_name: str,
             error_type, row.get('remediation_attempts', 0), failure_reason
         )
 
-    # Broadcast to dashboard
+    # Broadcast to dashboard with specific status
     try:
         await manager.broadcast({
             "event": "status_update",
             "ticket_id": ticket_id,
-            "new_status": "open",
+            "new_status": "in_progress",
+            "remediation_status": "applied_not_solved",
             "remediation_failed": True,
-            "escalated": True
+            "escalated": True,
+            "message": f"Auto-remediation applied but not solved after {row.get('remediation_attempts', 0)} attempts"
         })
     except Exception:
         pass
@@ -1605,6 +1890,136 @@ async def update_slack_message_on_remediation_success(channel: str, ts: str,
             )
     except Exception as e:
         logger.error(f"[AUTO-REM] Failed to update Slack message: {e}")
+
+
+async def send_slack_approval_request(ticket_id: str, pipeline_name: str,
+                                       error_type: str, remediation_action: str,
+                                       remediation_risk: str, business_impact: str,
+                                       root_cause: str, recommendations: list):
+    """
+    Sends Slack message requesting human approval for risky auto-remediation
+    Includes action buttons for Approve/Reject
+    """
+    if not SLACK_BOT_TOKEN:
+        logger.warning("[POLICY-ENGINE] Slack token not configured, cannot request approval")
+        return None
+
+    row = db_query("SELECT slack_ts, slack_channel FROM tickets WHERE id = :id", {"id": ticket_id}, one=True)
+    if not row:
+        return None
+
+    thread_ts = row.get('slack_ts')
+    channel = row.get('slack_channel') or SLACK_ALERT_CHANNEL
+
+    # Create approval request blocks
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "⚠️ Human Approval Required for Auto-Remediation"}
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Ticket ID:*\n{ticket_id}"},
+                {"type": "mrkdwn", "text": f"*Pipeline:*\n{pipeline_name}"},
+                {"type": "mrkdwn", "text": f"*Error Type:*\n{error_type}"},
+                {"type": "mrkdwn", "text": f"*Remediation Action:*\n`{remediation_action}`"},
+                {"type": "mrkdwn", "text": f"*Risk Level:*\n{remediation_risk}"},
+                {"type": "mrkdwn", "text": f"*Business Impact:*\n{business_impact}"}
+            ]
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Root Cause:*\n{root_cause[:300]}..."
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Recommended Actions:*\n" + "\n".join([f"• {rec}" for rec in recommendations[:3]])
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "🔴 *This remediation requires manual approval due to:*\n"
+                        "• High risk level or Critical severity\n"
+                        "• Potential business impact\n"
+                        "• Needs human review before proceeding"
+            }
+        }
+    ]
+
+    # Add action buttons
+    dash_url = f"{PUBLIC_BASE_URL.rstrip('/')}/dashboard?ticket={ticket_id}"
+    blocks.append({
+        "type": "actions",
+        "block_id": f"approval_{ticket_id}",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✅ Approve Auto-Remediation"},
+                "style": "primary",
+                "value": f"approve_{ticket_id}_{remediation_action}",
+                "action_id": "approve_remediation"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "❌ Reject & Manual Fix"},
+                "style": "danger",
+                "value": f"reject_{ticket_id}",
+                "action_id": "reject_remediation"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View Dashboard"},
+                "url": dash_url,
+                "action_id": "view_dashboard"
+            }
+        ]
+    })
+
+    payload = {
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "blocks": blocks,
+        "text": f"⚠️ Approval required for auto-remediation of {pipeline_name}"
+    }
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-type": "application/json; charset=utf-8"}
+
+    try:
+        response = requests.post("https://slack.com/api/chat.postMessage", headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            response_data = response.json()
+            if response_data.get("ok"):
+                approval_ts = response_data.get("ts")
+                logger.info(f"[POLICY-ENGINE] Approval request sent to Slack for {ticket_id}")
+
+                # Update ticket to mark as awaiting approval
+                db_execute('''UPDATE tickets
+                            SET remediation_status = :status,
+                                remediation_approval_requested_at = :requested_at
+                            WHERE id = :id''',
+                         {"status": "awaiting_approval", "requested_at": datetime.now(timezone.utc).isoformat(), "id": ticket_id})
+
+                # Log audit trail
+                log_audit(
+                    ticket_id=ticket_id, action="approval_requested", pipeline=pipeline_name,
+                    user_name="POLICY_ENGINE", user_empid="POLICY_001",
+                    details=f"Human approval requested for {remediation_action} due to {remediation_risk} risk"
+                )
+
+                return approval_ts
+            else:
+                logger.error(f"[POLICY-ENGINE] Slack API error: {response_data}")
+                return None
+    except Exception as e:
+        logger.exception(f"[POLICY-ENGINE] Failed to send Slack approval request: {e}")
+        return None
 
 
 async def send_slack_escalation_alert(channel: str, ts: str, ticket_id: str,
@@ -2036,28 +2451,66 @@ async def azure_monitor(request: Request):
         log_audit(ticket_id=tid, action="Slack Notification Failed", pipeline=pipeline, run_id=runid,
                   details=f"Error: {str(e)}")
 
-    # Auto-Remediation (if enabled)
-    if AUTO_REMEDIATION_ENABLED and rca.get("auto_heal_possible"):
+    # Auto-Remediation with Policy Engine (if enabled)
+    if AUTO_REMEDIATION_ENABLED:
+        # Check if AI recommends auto-remediation
+        is_auto_remediable = rca.get("is_auto_remediable", False)
+        requires_approval = rca.get("requires_human_approval", False)
         error_type = rca.get("error_type")
-        if error_type in REMEDIABLE_ERRORS:
-            logger.info(f"[AUTO-REM] Eligible for auto-remediation: {error_type} for ticket {tid}")
-            try:
-                # Trigger auto-remediation in background
-                asyncio.create_task(trigger_auto_remediation(
-                    ticket_id=tid,
-                    pipeline_name=pipeline,
-                    error_type=error_type,
-                    original_run_id=runid or "N/A",
-                    attempt_number=1
-                ))
-                log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=pipeline, run_id=runid,
-                         details=f"Auto-remediation triggered for error_type: {error_type}")
-            except Exception as e:
-                logger.error(f"[AUTO-REM] Failed to trigger auto-remediation: {e}")
-                log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=pipeline, run_id=runid,
-                         details=f"Error: {str(e)}")
-        else:
+        remediation_action = rca.get("remediation_action", "manual_intervention")
+        remediation_risk = rca.get("remediation_risk", "High")
+        business_impact = rca.get("business_impact", "Medium")
+
+        if is_auto_remediable and error_type in REMEDIABLE_ERRORS:
+            logger.info(f"[POLICY-ENGINE] Eligible for auto-remediation: {error_type} for ticket {tid}")
+
+            # POLICY ENGINE DECISION POINT
+            if requires_approval:
+                # Risky remediation - request human approval
+                logger.warning(f"[POLICY-ENGINE] Remediation requires human approval (Risk: {remediation_risk}, Impact: {business_impact})")
+                try:
+                    await send_slack_approval_request(
+                        ticket_id=tid,
+                        pipeline_name=pipeline,
+                        error_type=error_type,
+                        remediation_action=remediation_action,
+                        remediation_risk=remediation_risk,
+                        business_impact=business_impact,
+                        root_cause=rca.get("root_cause", "Unknown"),
+                        recommendations=rca.get("recommendations", [])
+                    )
+                    log_audit(ticket_id=tid, action="auto_remediation_approval_required", pipeline=pipeline, run_id=runid,
+                             details=f"Human approval required for {remediation_action} (Risk: {remediation_risk}, Impact: {business_impact})")
+                except Exception as e:
+                    logger.error(f"[POLICY-ENGINE] Failed to request approval: {e}")
+                    log_audit(ticket_id=tid, action="approval_request_failed", pipeline=pipeline, run_id=runid,
+                             details=f"Error: {str(e)}")
+            else:
+                # Low risk - proceed with auto-remediation
+                logger.info(f"[POLICY-ENGINE] Auto-remediation approved automatically (Risk: {remediation_risk}, Impact: {business_impact})")
+                try:
+                    # Trigger auto-remediation in background
+                    asyncio.create_task(trigger_auto_remediation(
+                        ticket_id=tid,
+                        pipeline_name=pipeline,
+                        error_type=error_type,
+                        original_run_id=runid or "N/A",
+                        attempt_number=1
+                    ))
+                    log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=pipeline, run_id=runid,
+                             details=f"Auto-remediation triggered for error_type: {error_type}, action: {remediation_action}")
+                except Exception as e:
+                    logger.error(f"[AUTO-REM] Failed to trigger auto-remediation: {e}")
+                    log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=pipeline, run_id=runid,
+                             details=f"Error: {str(e)}")
+        elif not is_auto_remediable:
+            logger.info(f"[POLICY-ENGINE] Not auto-remediable, requires manual intervention: {error_type}")
+            log_audit(ticket_id=tid, action="manual_intervention_required", pipeline=pipeline, run_id=runid,
+                     details=f"AI determined error is not auto-remediable. Action: {remediation_action}")
+        elif error_type not in REMEDIABLE_ERRORS:
             logger.info(f"[AUTO-REM] Error type {error_type} not in REMEDIABLE_ERRORS list")
+            log_audit(ticket_id=tid, action="error_type_not_remediable", pipeline=pipeline, run_id=runid,
+                     details=f"Error type {error_type} not configured in playbooks")
 
     logger.info(f"Successfully created ticket {tid} for ADF alert")
 
@@ -2128,7 +2581,9 @@ async def databricks_monitor(request: Request):
                         job_id=None,
                         cluster_id=cluster_id,
                         error_message=error_message,
-                        is_cluster_failure=True
+                        is_cluster_failure=True,
+                        webhook_payload=body,
+                        run_details=None
                     )
 
         except Exception as e:
@@ -2188,6 +2643,7 @@ async def databricks_monitor(request: Request):
     # ===================================================================================
     api_fetch_attempted = False
     api_fetch_success = False
+    run_details = None
 
     if run_id:
         api_fetch_attempted = True
@@ -2215,7 +2671,7 @@ async def databricks_monitor(request: Request):
     logger.info("=" * 120)
 
     # ===================================================================================
-    # STEP 5: Send to unified failure processor
+    # STEP 5: Send to unified failure processor (with webhook payload and run details)
     # ===================================================================================
     return await process_databricks_failure(
         job_name=job_name,
@@ -2223,13 +2679,16 @@ async def databricks_monitor(request: Request):
         job_id=job_id,
         cluster_id=cluster_id,
         error_message=error_message,
-        is_cluster_failure=False
+        is_cluster_failure=False,
+        webhook_payload=body,
+        run_details=run_details
     )
 
 # ====================================================================================================
 #  UNIFIED PROCESSOR — Handles both job and cluster failures (100% of your original code preserved)
 # ====================================================================================================
-async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error_message, is_cluster_failure):
+async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error_message, is_cluster_failure,
+                                      webhook_payload=None, run_details=None):
 
     logger.info(f"Processing {'Cluster' if is_cluster_failure else 'Job'} Failure")
 
@@ -2314,6 +2773,26 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
     logger.info(f"🎫 Ticket created: {tid}")
 
     # -----------------------
+    # BLOB UPLOAD (Databricks Logs)
+    # -----------------------
+    blob_url = None
+    if AZURE_BLOB_ENABLED and (webhook_payload or run_details):
+        try:
+            blob_url = await asyncio.to_thread(
+                upload_databricks_logs_to_blob,
+                tid,
+                run_details if run_details else {},
+                webhook_payload if webhook_payload else {}
+            )
+            if blob_url:
+                # Update ticket with blob URL
+                db_execute("UPDATE tickets SET blob_log_url = :url WHERE id = :id",
+                          {"url": blob_url, "id": tid})
+                logger.info(f"✅ Databricks logs uploaded to blob for ticket {tid}")
+        except Exception as e:
+            logger.error(f"❌ Failed to upload Databricks logs to blob: {e}")
+
+    # -----------------------
     # AUDIT LOG
     # -----------------------
     log_audit(
@@ -2322,7 +2801,7 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
         pipeline=job_name,
         run_id=run_id or "N/A",
         rca_summary=rca.get("root_cause", "")[:150],
-        details=f"Source={'Cluster' if is_cluster_failure else 'Job'} Failure",
+        details=f"Source={'Cluster' if is_cluster_failure else 'Job'} Failure. Blob URL: {blob_url or 'Not uploaded'}",
         finops_team=finops_tags["team"],
         finops_owner=finops_tags["owner"]
     )
@@ -2355,6 +2834,72 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
         post_slack_notification(tid, essentials, rca, None)
     except:
         pass
+
+    # -----------------------
+    # AUTO-REMEDIATION WITH POLICY ENGINE (Databricks)
+    # -----------------------
+    if AUTO_REMEDIATION_ENABLED:
+        # Check if AI recommends auto-remediation
+        is_auto_remediable = rca.get("is_auto_remediable", False)
+        requires_approval = rca.get("requires_human_approval", False)
+        error_type = rca.get("error_type")
+        remediation_action = rca.get("remediation_action", "manual_intervention")
+        remediation_risk = rca.get("remediation_risk", "High")
+        business_impact = rca.get("business_impact", "Medium")
+
+        if is_auto_remediable and error_type in REMEDIABLE_ERRORS:
+            logger.info(f"[POLICY-ENGINE] Databricks eligible for auto-remediation: {error_type} for ticket {tid}")
+
+            # POLICY ENGINE DECISION POINT
+            if requires_approval:
+                # Risky remediation - request human approval
+                logger.warning(f"[POLICY-ENGINE] Databricks remediation requires human approval (Risk: {remediation_risk}, Impact: {business_impact})")
+                try:
+                    await send_slack_approval_request(
+                        ticket_id=tid,
+                        pipeline_name=job_name,
+                        error_type=error_type,
+                        remediation_action=remediation_action,
+                        remediation_risk=remediation_risk,
+                        business_impact=business_impact,
+                        root_cause=rca.get("root_cause", "Unknown"),
+                        recommendations=rca.get("recommendations", [])
+                    )
+                    log_audit(ticket_id=tid, action="auto_remediation_approval_required", pipeline=job_name, run_id=run_id or "N/A",
+                             details=f"Human approval required for {remediation_action} (Risk: {remediation_risk}, Impact: {business_impact})")
+                except Exception as e:
+                    logger.error(f"[POLICY-ENGINE] Failed to request approval: {e}")
+                    log_audit(ticket_id=tid, action="approval_request_failed", pipeline=job_name, run_id=run_id or "N/A",
+                             details=f"Error: {str(e)}")
+            else:
+                # Low risk - proceed with auto-remediation
+                logger.info(f"[POLICY-ENGINE] Databricks auto-remediation approved automatically (Risk: {remediation_risk}, Impact: {business_impact})")
+                try:
+                    # For Databricks, we need to call the databricks-specific remediation Logic App
+                    # Update the trigger call to pass Databricks-specific fields
+                    asyncio.create_task(trigger_databricks_remediation(
+                        ticket_id=tid,
+                        job_name=job_name,
+                        job_id=job_id,
+                        cluster_id=cluster_id,
+                        run_id=run_id or "N/A",
+                        error_type=error_type,
+                        attempt_number=1
+                    ))
+                    log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=job_name, run_id=run_id or "N/A",
+                             details=f"Auto-remediation triggered for error_type: {error_type}, action: {remediation_action}")
+                except Exception as e:
+                    logger.error(f"[AUTO-REM] Failed to trigger Databricks auto-remediation: {e}")
+                    log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=job_name, run_id=run_id or "N/A",
+                             details=f"Error: {str(e)}")
+        elif not is_auto_remediable:
+            logger.info(f"[POLICY-ENGINE] Databricks not auto-remediable, requires manual intervention: {error_type}")
+            log_audit(ticket_id=tid, action="manual_intervention_required", pipeline=job_name, run_id=run_id or "N/A",
+                     details=f"AI determined error is not auto-remediable. Action: {remediation_action}")
+        elif error_type not in REMEDIABLE_ERRORS:
+            logger.info(f"[AUTO-REM] Databricks error type {error_type} not in REMEDIABLE_ERRORS list")
+            log_audit(ticket_id=tid, action="error_type_not_remediable", pipeline=job_name, run_id=run_id or "N/A",
+                     details=f"Error type {error_type} not configured in playbooks")
 
     return {"status": "ticket_created", "ticket_id": tid}
 

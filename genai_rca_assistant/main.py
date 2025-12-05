@@ -2368,18 +2368,18 @@ async def azure_monitor(request: Request):
     # Flow explanation:
     # 1. Error occurs → Webhook creates ticket → RCA analysis
     # 2. If auto-remediable → Slack approval requested (status: 'awaiting_approval')
-    # 3. Approved → Remediation triggered (status: 'in_progress')
+    # 3. User clicks Approve → Remediation triggered (status: 'in_progress')
     # 4. Remediation fails → Logic App callback handles retry (NOT webhook)
     # 5. After 3 attempts fail → Status changes to 'applied_not_solved'
     # 6. Once 'applied_not_solved', NEW webhooks are allowed for new failures
     #
-    # During steps 2-4, ALL webhooks for this pipeline are BLOCKED
-    # This prevents infinite loops when remediation attempts trigger new alerts
+    # Only block on 'awaiting_approval' and 'in_progress' (NOT 'pending')
+    # This prevents stuck 'pending' tickets from blocking everything forever
     active_remediation = db_query("""
         SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id, timestamp
         FROM tickets
         WHERE pipeline = :pipeline
-        AND remediation_status IN ('pending', 'in_progress', 'awaiting_approval')
+        AND remediation_status IN ('awaiting_approval', 'in_progress')
         AND timestamp > datetime('now', '-30 minutes')
         ORDER BY timestamp DESC
         LIMIT 1
@@ -2513,60 +2513,47 @@ async def azure_monitor(request: Request):
         log_audit(ticket_id=tid, action="Slack Notification Failed", pipeline=pipeline, run_id=runid,
                   details=f"Error: {str(e)}")
 
-    # Auto-Remediation with Policy Engine (if enabled)
+    # Auto-Remediation with Slack Approval (if enabled)
     if AUTO_REMEDIATION_ENABLED:
         # Check if AI recommends auto-remediation
         is_auto_remediable = rca.get("is_auto_remediable", False)
-        requires_approval = rca.get("requires_human_approval", False)
         error_type = rca.get("error_type")
         remediation_action = rca.get("remediation_action", "manual_intervention")
         remediation_risk = rca.get("remediation_risk", "High")
         business_impact = rca.get("business_impact", "Medium")
 
         if is_auto_remediable and error_type in REMEDIABLE_ERRORS:
-            logger.info(f"[POLICY-ENGINE] Eligible for auto-remediation: {error_type} for ticket {tid}")
+            logger.info(f"[AUTO-REM] ✓ Eligible for auto-remediation: {error_type} for ticket {tid}")
+            logger.info(f"[AUTO-REM] Requesting Slack approval before triggering remediation")
 
-            # POLICY ENGINE DECISION POINT
-            if requires_approval:
-                # Risky remediation - request human approval
-                logger.warning(f"[POLICY-ENGINE] Remediation requires human approval (Risk: {remediation_risk}, Impact: {business_impact})")
-                try:
-                    await send_slack_approval_request(
-                        ticket_id=tid,
-                        pipeline_name=pipeline,
-                        error_type=error_type,
-                        remediation_action=remediation_action,
-                        remediation_risk=remediation_risk,
-                        business_impact=business_impact,
-                        root_cause=rca.get("root_cause", "Unknown"),
-                        recommendations=rca.get("recommendations", [])
-                    )
-                    log_audit(ticket_id=tid, action="auto_remediation_approval_required", pipeline=pipeline, run_id=runid,
-                             details=f"Human approval required for {remediation_action} (Risk: {remediation_risk}, Impact: {business_impact})")
-                except Exception as e:
-                    logger.error(f"[POLICY-ENGINE] Failed to request approval: {e}")
-                    log_audit(ticket_id=tid, action="approval_request_failed", pipeline=pipeline, run_id=runid,
-                             details=f"Error: {str(e)}")
-            else:
-                # Low risk - proceed with auto-remediation
-                logger.info(f"[POLICY-ENGINE] Auto-remediation approved automatically (Risk: {remediation_risk}, Impact: {business_impact})")
-                try:
-                    # Trigger auto-remediation in background
-                    asyncio.create_task(trigger_auto_remediation(
-                        ticket_id=tid,
-                        pipeline_name=pipeline,
-                        error_type=error_type,
-                        original_run_id=runid or "N/A",
-                        attempt_number=1
-                    ))
-                    log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=pipeline, run_id=runid,
-                             details=f"Auto-remediation triggered for error_type: {error_type}, action: {remediation_action}")
-                except Exception as e:
-                    logger.error(f"[AUTO-REM] Failed to trigger auto-remediation: {e}")
-                    log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=pipeline, run_id=runid,
-                             details=f"Error: {str(e)}")
+            try:
+                # Send Slack approval request
+                await send_slack_approval_request(
+                    ticket_id=tid,
+                    pipeline_name=pipeline,
+                    error_type=error_type,
+                    remediation_action=remediation_action,
+                    remediation_risk=remediation_risk,
+                    business_impact=business_impact,
+                    root_cause=rca.get("root_cause", "Unknown"),
+                    recommendations=rca.get("recommendations", [])
+                )
+
+                # Update ticket status to awaiting_approval
+                db_execute('''UPDATE tickets
+                            SET remediation_status = :status,
+                                remediation_approval_requested_at = :requested_at
+                            WHERE id = :id''',
+                         {"status": "awaiting_approval", "requested_at": datetime.now(timezone.utc).isoformat(), "id": tid})
+
+                log_audit(ticket_id=tid, action="auto_remediation_approval_requested", pipeline=pipeline, run_id=runid,
+                         details=f"Slack approval requested for {remediation_action} (Risk: {remediation_risk}, Impact: {business_impact})")
+            except Exception as e:
+                logger.error(f"[AUTO-REM] Failed to request approval: {e}")
+                log_audit(ticket_id=tid, action="approval_request_failed", pipeline=pipeline, run_id=runid,
+                         details=f"Error: {str(e)}")
         elif not is_auto_remediable:
-            logger.info(f"[POLICY-ENGINE] Not auto-remediable, requires manual intervention: {error_type}")
+            logger.info(f"[AUTO-REM] Not auto-remediable, requires manual intervention: {error_type}")
             log_audit(ticket_id=tid, action="manual_intervention_required", pipeline=pipeline, run_id=runid,
                      details=f"AI determined error is not auto-remediable. Action: {remediation_action}")
         elif error_type not in REMEDIABLE_ERRORS:
@@ -3004,64 +2991,47 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
         pass
 
     # -----------------------
-    # AUTO-REMEDIATION WITH POLICY ENGINE (Databricks)
-    # -----------------------
+    # Auto-Remediation with Slack Approval (Databricks)
     if AUTO_REMEDIATION_ENABLED:
         # Check if AI recommends auto-remediation
         is_auto_remediable = rca.get("is_auto_remediable", False)
-        requires_approval = rca.get("requires_human_approval", False)
         error_type = rca.get("error_type")
         remediation_action = rca.get("remediation_action", "manual_intervention")
         remediation_risk = rca.get("remediation_risk", "High")
         business_impact = rca.get("business_impact", "Medium")
 
         if is_auto_remediable and error_type in REMEDIABLE_ERRORS:
-            logger.info(f"[POLICY-ENGINE] Databricks eligible for auto-remediation: {error_type} for ticket {tid}")
+            logger.info(f"[AUTO-REM] ✓ Databricks eligible for auto-remediation: {error_type} for ticket {tid}")
+            logger.info(f"[AUTO-REM] Requesting Slack approval before triggering remediation")
 
-            # POLICY ENGINE DECISION POINT
-            if requires_approval:
-                # Risky remediation - request human approval
-                logger.warning(f"[POLICY-ENGINE] Databricks remediation requires human approval (Risk: {remediation_risk}, Impact: {business_impact})")
-                try:
-                    await send_slack_approval_request(
-                        ticket_id=tid,
-                        pipeline_name=job_name,
-                        error_type=error_type,
-                        remediation_action=remediation_action,
-                        remediation_risk=remediation_risk,
-                        business_impact=business_impact,
-                        root_cause=rca.get("root_cause", "Unknown"),
-                        recommendations=rca.get("recommendations", [])
-                    )
-                    log_audit(ticket_id=tid, action="auto_remediation_approval_required", pipeline=job_name, run_id=run_id or "N/A",
-                             details=f"Human approval required for {remediation_action} (Risk: {remediation_risk}, Impact: {business_impact})")
-                except Exception as e:
-                    logger.error(f"[POLICY-ENGINE] Failed to request approval: {e}")
-                    log_audit(ticket_id=tid, action="approval_request_failed", pipeline=job_name, run_id=run_id or "N/A",
-                             details=f"Error: {str(e)}")
-            else:
-                # Low risk - proceed with auto-remediation
-                logger.info(f"[POLICY-ENGINE] Databricks auto-remediation approved automatically (Risk: {remediation_risk}, Impact: {business_impact})")
-                try:
-                    # For Databricks, we need to call the databricks-specific remediation Logic App
-                    # Update the trigger call to pass Databricks-specific fields
-                    asyncio.create_task(trigger_databricks_remediation(
-                        ticket_id=tid,
-                        job_name=job_name,
-                        job_id=job_id,
-                        cluster_id=cluster_id,
-                        run_id=run_id or "N/A",
-                        error_type=error_type,
-                        attempt_number=1
-                    ))
-                    log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=job_name, run_id=run_id or "N/A",
-                             details=f"Auto-remediation triggered for error_type: {error_type}, action: {remediation_action}")
-                except Exception as e:
-                    logger.error(f"[AUTO-REM] Failed to trigger Databricks auto-remediation: {e}")
-                    log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=job_name, run_id=run_id or "N/A",
-                             details=f"Error: {str(e)}")
+            try:
+                # Send Slack approval request
+                await send_slack_approval_request(
+                    ticket_id=tid,
+                    pipeline_name=job_name,
+                    error_type=error_type,
+                    remediation_action=remediation_action,
+                    remediation_risk=remediation_risk,
+                    business_impact=business_impact,
+                    root_cause=rca.get("root_cause", "Unknown"),
+                    recommendations=rca.get("recommendations", [])
+                )
+
+                # Update ticket status to awaiting_approval
+                db_execute('''UPDATE tickets
+                            SET remediation_status = :status,
+                                remediation_approval_requested_at = :requested_at
+                            WHERE id = :id''',
+                         {"status": "awaiting_approval", "requested_at": datetime.now(timezone.utc).isoformat(), "id": tid})
+
+                log_audit(ticket_id=tid, action="auto_remediation_approval_requested", pipeline=job_name, run_id=run_id or "N/A",
+                         details=f"Slack approval requested for {remediation_action} (Risk: {remediation_risk}, Impact: {business_impact})")
+            except Exception as e:
+                logger.error(f"[AUTO-REM] Failed to request Databricks approval: {e}")
+                log_audit(ticket_id=tid, action="approval_request_failed", pipeline=job_name, run_id=run_id or "N/A",
+                         details=f"Error: {str(e)}")
         elif not is_auto_remediable:
-            logger.info(f"[POLICY-ENGINE] Databricks not auto-remediable, requires manual intervention: {error_type}")
+            logger.info(f"[AUTO-REM] Databricks not auto-remediable, requires manual intervention: {error_type}")
             log_audit(ticket_id=tid, action="manual_intervention_required", pipeline=job_name, run_id=run_id or "N/A",
                      details=f"AI determined error is not auto-remediable. Action: {remediation_action}")
         elif error_type not in REMEDIABLE_ERRORS:

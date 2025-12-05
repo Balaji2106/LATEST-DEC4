@@ -48,7 +48,7 @@
             }
         },
         "actions": {
-            "Initialize_PipelineStatus": {
+            "Initialize_Variables": {
                 "type": "InitializeVariable",
                 "inputs": {
                     "variables": [
@@ -56,32 +56,12 @@
                             "name": "PipelineStatus",
                             "type": "string",
                             "value": "InProgress"
-                        }
-                    ]
-                },
-                "runAfter": {}
-            },
-            "Initialize_RunId": {
-                "type": "InitializeVariable",
-                "inputs": {
-                    "variables": [
+                        },
                         {
                             "name": "RunId",
                             "type": "string",
                             "value": ""
-                        }
-                    ]
-                },
-                "runAfter": {
-                    "Initialize_PipelineStatus": [
-                        "Succeeded"
-                    ]
-                }
-            },
-            "Initialize_AttemptNumber": {
-                "type": "InitializeVariable",
-                "inputs": {
-                    "variables": [
+                        },
                         {
                             "name": "AttemptNumber",
                             "type": "integer",
@@ -89,11 +69,7 @@
                         }
                     ]
                 },
-                "runAfter": {
-                    "Initialize_RunId": [
-                        "Succeeded"
-                    ]
-                }
+                "runAfter": {}
             },
             "Create_a_pipeline_run": {
                 "type": "ApiConnection",
@@ -110,7 +86,7 @@
                     }
                 },
                 "runAfter": {
-                    "Initialize_AttemptNumber": [
+                    "Initialize_Variables": [
                         "Succeeded"
                     ]
                 }
@@ -136,17 +112,13 @@
                 },
                 "actions": {
                     "Get_Pipeline_Run_Status": {
-                        "type": "ApiConnection",
+                        "type": "Http",
                         "inputs": {
-                            "host": {
-                                "connection": {
-                                    "name": "@parameters('$connections')['azuredatafactory']['connectionId']"
-                                }
-                            },
-                            "method": "get",
-                            "path": "/subscriptions/@{encodeURIComponent('d28a053b-ed09-40dd-92d6-43401a2c9799')}/resourcegroups/@{encodeURIComponent('rg_techdemo_2025_Q4')}/providers/Microsoft.DataFactory/factories/@{encodeURIComponent('adf-techdemo-rca')}/pipelineruns/@{encodeURIComponent(variables('RunId'))}",
-                            "queries": {
-                                "x-ms-api-version": "2017-09-01-preview"
+                            "method": "GET",
+                            "uri": "https://management.azure.com/subscriptions/d28a053b-ed09-40dd-92d6-43401a2c9799/resourceGroups/rg_techdemo_2025_Q4/providers/Microsoft.DataFactory/factories/adf-techdemo-rca/pipelineruns/@{variables('RunId')}?api-version=2018-06-01",
+                            "authentication": {
+                                "type": "ManagedServiceIdentity",
+                                "audience": "https://management.azure.com"
                             }
                         },
                         "runAfter": {}
@@ -155,7 +127,7 @@
                         "type": "SetVariable",
                         "inputs": {
                             "name": "PipelineStatus",
-                            "value": "@body('Get_Pipeline_Run_Status')?['status']"
+                            "value": "@body('Get_Pipeline_Run_Status')?['properties']?['status']"
                         },
                         "runAfter": {
                             "Get_Pipeline_Run_Status": [

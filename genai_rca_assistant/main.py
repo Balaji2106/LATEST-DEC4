@@ -729,11 +729,23 @@ AUTO-REMEDIATION DECISION RULES (MUST FOLLOW STRICTLY):
    - Manual intervention: 30+ minutes
 
 IMPORTANT:
-- Be STRICT - when in doubt, set is_auto_remediable = false
+- For infrastructure errors (timeouts, cluster failures, library issues, connection failures): set is_auto_remediable = true
+- For data/logic errors (schema mismatch, invalid data, permissions): set is_auto_remediable = false
+- When error type matches a known auto-remediable pattern, trust the pattern
 - ALWAYS provide remediation_action even if not auto-remediable
 - In your root_cause, explicitly mention "{service_name}" (not any other service)
 - Analyze logically - don't invent details. Use only what's in the message
 - Be specific about the affected entity (cluster name, job name, table name, etc.)
+
+EXPLICIT AUTO-REMEDIABLE EXAMPLES:
+✅ DatabricksLibraryInstallationError → is_auto_remediable=true, action=reinstall_libraries
+✅ DatabricksTimeoutError → is_auto_remediable=true, action=retry_job
+✅ DatabricksJobExecutionError (transient) → is_auto_remediable=true, action=retry_job
+✅ DatabricksClusterStartFailure → is_auto_remediable=true, action=restart_cluster
+✅ GatewayTimeout → is_auto_remediable=true, action=retry_pipeline
+✅ HttpConnectionFailed → is_auto_remediable=true, action=retry_pipeline
+❌ DatabricksPermissionDenied → is_auto_remediable=false (needs IAM changes)
+❌ UserErrorColumnNameInvalid → is_auto_remediable=false (needs code fix)
 
 Error Message:
 \"\"\"{service_prefixed_desc}\"\"\"
@@ -865,11 +877,23 @@ AUTO-REMEDIATION DECISION RULES (MUST FOLLOW STRICTLY):
    - Manual intervention: 30+ minutes
 
 IMPORTANT:
-- Be STRICT - when in doubt, set is_auto_remediable = false
+- For infrastructure errors (timeouts, cluster failures, library issues, connection failures): set is_auto_remediable = true
+- For data/logic errors (schema mismatch, invalid data, permissions): set is_auto_remediable = false
+- When error type matches a known auto-remediable pattern, trust the pattern
 - ALWAYS provide remediation_action even if not auto-remediable
 - In your root_cause, explicitly mention "{service_name}" (not any other service)
 - Analyze logically - don't invent details. Use only what's in the message
 - Be specific about the affected entity (cluster name, job name, table name, etc.)
+
+EXPLICIT AUTO-REMEDIABLE EXAMPLES:
+✅ DatabricksLibraryInstallationError → is_auto_remediable=true, action=reinstall_libraries
+✅ DatabricksTimeoutError → is_auto_remediable=true, action=retry_job
+✅ DatabricksJobExecutionError (transient) → is_auto_remediable=true, action=retry_job
+✅ DatabricksClusterStartFailure → is_auto_remediable=true, action=restart_cluster
+✅ GatewayTimeout → is_auto_remediable=true, action=retry_pipeline
+✅ HttpConnectionFailed → is_auto_remediable=true, action=retry_pipeline
+❌ DatabricksPermissionDenied → is_auto_remediable=false (needs IAM changes)
+❌ UserErrorColumnNameInvalid → is_auto_remediable=false (needs code fix)
 
 Error Message:
 \"\"\"{service_prefixed_desc}\"\"\"

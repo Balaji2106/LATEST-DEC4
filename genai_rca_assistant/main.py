@@ -132,6 +132,12 @@ REMEDIABLE_ERRORS: Dict[str, Dict] = {
         "backoff_seconds": [30, 60, 120, 300, 600],
         "playbook_url": os.getenv("PLAYBOOK_RETRY_PIPELINE")
     },
+    "SqlFailedToConnect": {
+        "action": "retry_pipeline",
+        "max_retries": 3,
+        "backoff_seconds": [60, 120, 300],  # Wait 1 min, 2 min, 5 min
+        "playbook_url": os.getenv("PLAYBOOK_RETRY_PIPELINE")
+    },
 
     # Databricks Cluster Errors
     "DatabricksClusterStartFailure": {

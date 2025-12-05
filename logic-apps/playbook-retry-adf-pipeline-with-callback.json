@@ -2,33 +2,53 @@
     "definition": {
         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
         "contentVersion": "1.0.0.0",
-        "parameters": {},
         "triggers": {
-            "manual": {
+            "When_RCA_sends_auto_remediation_request": {
                 "type": "Request",
                 "kind": "Http",
                 "inputs": {
                     "schema": {
                         "type": "object",
                         "properties": {
-                            "pipeline_name": {"type": "string"},
-                            "ticket_id": {"type": "string"},
-                            "error_type": {"type": "string"},
-                            "original_run_id": {"type": "string"},
-                            "retry_attempt": {"type": "integer"},
-                            "max_retries": {"type": "integer"},
-                            "remediation_action": {"type": "string"},
-                            "timestamp": {"type": "string"},
-                            "callback_url": {"type": "string"}
+                            "pipeline_name": {
+                                "type": "string"
+                            },
+                            "ticket_id": {
+                                "type": "string"
+                            },
+                            "error_type": {
+                                "type": "string"
+                            },
+                            "original_run_id": {
+                                "type": "string"
+                            },
+                            "retry_attempt": {
+                                "type": "integer"
+                            },
+                            "max_retries": {
+                                "type": "integer"
+                            },
+                            "remediation_action": {
+                                "type": "string"
+                            },
+                            "timestamp": {
+                                "type": "string"
+                            },
+                            "callback_url": {
+                                "type": "string"
+                            }
                         },
-                        "required": ["pipeline_name", "ticket_id", "callback_url"]
+                        "required": [
+                            "pipeline_name",
+                            "ticket_id",
+                            "callback_url"
+                        ]
                     }
                 }
             }
         },
         "actions": {
             "Initialize_PipelineStatus": {
-                "runAfter": {},
                 "type": "InitializeVariable",
                 "inputs": {
                     "variables": [
@@ -38,12 +58,10 @@
                             "value": "InProgress"
                         }
                     ]
-                }
+                },
+                "runAfter": {}
             },
             "Initialize_RunId": {
-                "runAfter": {
-                    "Initialize_PipelineStatus": ["Succeeded"]
-                },
                 "type": "InitializeVariable",
                 "inputs": {
                     "variables": [
@@ -53,12 +71,14 @@
                             "value": ""
                         }
                     ]
+                },
+                "runAfter": {
+                    "Initialize_PipelineStatus": [
+                        "Succeeded"
+                    ]
                 }
             },
             "Initialize_AttemptNumber": {
-                "runAfter": {
-                    "Initialize_RunId": ["Succeeded"]
-                },
                 "type": "InitializeVariable",
                 "inputs": {
                     "variables": [
@@ -68,12 +88,14 @@
                             "value": "@triggerBody()?['retry_attempt']"
                         }
                     ]
+                },
+                "runAfter": {
+                    "Initialize_RunId": [
+                        "Succeeded"
+                    ]
                 }
             },
-            "Trigger_ADF_Pipeline": {
-                "runAfter": {
-                    "Initialize_AttemptNumber": ["Succeeded"]
-                },
+            "Create_a_pipeline_run": {
                 "type": "ApiConnection",
                 "inputs": {
                     "host": {
@@ -82,35 +104,38 @@
                         }
                     },
                     "method": "post",
-                    "path": "/subscriptions/@{encodeURIComponent('<SUBSCRIPTION_ID>')}/resourcegroups/@{encodeURIComponent('<RESOURCE_GROUP>')}/providers/Microsoft.DataFactory/factories/@{encodeURIComponent('<DATA_FACTORY_NAME>')}/pipelines/@{encodeURIComponent(triggerBody()?['pipeline_name'])}/CreateRun",
+                    "path": "/subscriptions/@{encodeURIComponent('d28a053b-ed09-40dd-92d6-43401a2c9799')}/resourcegroups/@{encodeURIComponent('rg_techdemo_2025_Q4')}/providers/Microsoft.DataFactory/factories/@{encodeURIComponent('adf-techdemo-rca')}/pipelines/@{encodeURIComponent(triggerBody()?['pipeline_name'])}/CreateRun",
                     "queries": {
                         "x-ms-api-version": "2017-09-01-preview"
                     }
+                },
+                "runAfter": {
+                    "Initialize_AttemptNumber": [
+                        "Succeeded"
+                    ]
                 }
             },
             "Set_RunId": {
-                "runAfter": {
-                    "Trigger_ADF_Pipeline": ["Succeeded"]
-                },
                 "type": "SetVariable",
                 "inputs": {
                     "name": "RunId",
-                    "value": "@body('Trigger_ADF_Pipeline')?['runId']"
+                    "value": "@body('Create_a_pipeline_run')?['runId']"
+                },
+                "runAfter": {
+                    "Create_a_pipeline_run": [
+                        "Succeeded"
+                    ]
                 }
             },
             "Monitor_Pipeline_Until_Complete": {
-                "runAfter": {
-                    "Set_RunId": ["Succeeded"]
-                },
                 "type": "Until",
-                "expression": "@or(equals(variables('PipelineStatus'), 'Succeeded'), equals(variables('PipelineStatus'), 'Failed'), equals(variables('PipelineStatus'), 'Cancelled'))",
+                "expression": "@or(or(equals(variables('PipelineStatus'), 'Succeeded'), equals(variables('PipelineStatus'), 'Failed')), equals(variables('PipelineStatus'), 'Cancelled'))",
                 "limit": {
                     "count": 60,
                     "timeout": "PT1H"
                 },
                 "actions": {
                     "Get_Pipeline_Run_Status": {
-                        "runAfter": {},
                         "type": "ApiConnection",
                         "inputs": {
                             "host": {
@@ -119,40 +144,47 @@
                                 }
                             },
                             "method": "get",
-                            "path": "/subscriptions/@{encodeURIComponent('<SUBSCRIPTION_ID>')}/resourcegroups/@{encodeURIComponent('<RESOURCE_GROUP>')}/providers/Microsoft.DataFactory/factories/@{encodeURIComponent('<DATA_FACTORY_NAME>')}/pipelineruns/@{encodeURIComponent(variables('RunId'))}",
+                            "path": "/subscriptions/@{encodeURIComponent('d28a053b-ed09-40dd-92d6-43401a2c9799')}/resourcegroups/@{encodeURIComponent('rg_techdemo_2025_Q4')}/providers/Microsoft.DataFactory/factories/@{encodeURIComponent('adf-techdemo-rca')}/pipelineruns/@{encodeURIComponent(variables('RunId'))}",
                             "queries": {
                                 "x-ms-api-version": "2017-09-01-preview"
                             }
-                        }
+                        },
+                        "runAfter": {}
                     },
                     "Update_PipelineStatus": {
-                        "runAfter": {
-                            "Get_Pipeline_Run_Status": ["Succeeded"]
-                        },
                         "type": "SetVariable",
                         "inputs": {
                             "name": "PipelineStatus",
                             "value": "@body('Get_Pipeline_Run_Status')?['status']"
+                        },
+                        "runAfter": {
+                            "Get_Pipeline_Run_Status": [
+                                "Succeeded"
+                            ]
                         }
                     },
                     "Delay_30_Seconds": {
-                        "runAfter": {
-                            "Update_PipelineStatus": ["Succeeded"]
-                        },
                         "type": "Wait",
                         "inputs": {
                             "interval": {
                                 "count": 30,
                                 "unit": "Second"
                             }
+                        },
+                        "runAfter": {
+                            "Update_PipelineStatus": [
+                                "Succeeded"
+                            ]
                         }
                     }
+                },
+                "runAfter": {
+                    "Set_RunId": [
+                        "Succeeded"
+                    ]
                 }
             },
             "Check_Pipeline_Result": {
-                "runAfter": {
-                    "Monitor_Pipeline_Until_Complete": ["Succeeded"]
-                },
                 "type": "Switch",
                 "expression": "@variables('PipelineStatus')",
                 "cases": {
@@ -160,7 +192,6 @@
                         "case": "Succeeded",
                         "actions": {
                             "Callback_Success": {
-                                "runAfter": {},
                                 "type": "Http",
                                 "inputs": {
                                     "method": "POST",
@@ -179,7 +210,8 @@
                                         "error_type": "@triggerBody()?['error_type']",
                                         "timestamp": "@utcNow()"
                                     }
-                                }
+                                },
+                                "runAfter": {}
                             }
                         }
                     },
@@ -187,7 +219,6 @@
                         "case": "Failed",
                         "actions": {
                             "Callback_Failure": {
-                                "runAfter": {},
                                 "type": "Http",
                                 "inputs": {
                                     "method": "POST",
@@ -207,7 +238,8 @@
                                         "error_message": "Pipeline run failed after retry attempt @{variables('AttemptNumber')}",
                                         "timestamp": "@utcNow()"
                                     }
-                                }
+                                },
+                                "runAfter": {}
                             }
                         }
                     }
@@ -215,7 +247,6 @@
                 "default": {
                     "actions": {
                         "Callback_Cancelled": {
-                            "runAfter": {},
                             "type": "Http",
                             "inputs": {
                                 "method": "POST",
@@ -235,21 +266,35 @@
                                     "error_message": "Pipeline run was cancelled or timed out",
                                     "timestamp": "@utcNow()"
                                 }
-                            }
+                            },
+                            "runAfter": {}
                         }
                     }
+                },
+                "runAfter": {
+                    "Monitor_Pipeline_Until_Complete": [
+                        "Succeeded"
+                    ]
                 }
             }
         },
-        "outputs": {}
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
     },
     "parameters": {
         "$connections": {
+            "type": "Object",
             "value": {
                 "azuredatafactory": {
-                    "connectionId": "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.Web/connections/azuredatafactory",
+                    "id": "/subscriptions/d28a053b-ed09-40dd-92d6-43401a2c9799/providers/Microsoft.Web/locations/northcentralus/managedApis/azuredatafactory",
+                    "connectionId": "/subscriptions/d28a053b-ed09-40dd-92d6-43401a2c9799/resourceGroups/rg_techdemo_2025_Q4/providers/Microsoft.Web/connections/azuredatafactory",
                     "connectionName": "azuredatafactory",
-                    "id": "/subscriptions/<SUBSCRIPTION_ID>/providers/Microsoft.Web/locations/<LOCATION>/managedApis/azuredatafactory"
+                    "connectionProperties": {}
                 }
             }
         }

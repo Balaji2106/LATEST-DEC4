@@ -2362,37 +2362,53 @@ async def azure_monitor(request: Request):
                 "existing_status": existing.get("status")
             })
 
-    # Check 2: Active remediation in progress for this pipeline (retry failure)
+    # Check 2: Active remediation in progress for this pipeline
+    # CRITICAL: During active remediation, BLOCK ALL webhooks to prevent infinite loops
+    #
+    # Flow explanation:
+    # 1. Error occurs → Webhook creates ticket → RCA analysis
+    # 2. If auto-remediable → Slack approval requested (status: 'awaiting_approval')
+    # 3. Approved → Remediation triggered (status: 'in_progress')
+    # 4. Remediation fails → Logic App callback handles retry (NOT webhook)
+    # 5. After 3 attempts fail → Status changes to 'applied_not_solved'
+    # 6. Once 'applied_not_solved', NEW webhooks are allowed for new failures
+    #
+    # During steps 2-4, ALL webhooks for this pipeline are BLOCKED
+    # This prevents infinite loops when remediation attempts trigger new alerts
     active_remediation = db_query("""
-        SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id
+        SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id, timestamp
         FROM tickets
         WHERE pipeline = :pipeline
         AND remediation_status IN ('pending', 'in_progress', 'awaiting_approval')
-        AND timestamp > datetime('now', '-20 minutes')
+        AND timestamp > datetime('now', '-30 minutes')
         ORDER BY timestamp DESC
         LIMIT 1
     """, {"pipeline": pipeline}, one=True)
 
     if active_remediation:
-        logger.info(f"[WEBHOOK-DEDUP] Active remediation found for pipeline {pipeline}")
-        logger.info(f"[WEBHOOK-DEDUP] Ticket: {active_remediation['id']}, Attempts: {active_remediation.get('remediation_attempts', 0)}")
-        logger.info(f"[WEBHOOK-DEDUP] Webhook run_id: {runid}, Original ticket run_id: {active_remediation.get('run_id')}")
+        logger.warning(f"[WEBHOOK-BLOCK] Active remediation in progress for pipeline {pipeline} - BLOCKING webhook")
+        logger.info(f"[WEBHOOK-BLOCK] Active ticket: {active_remediation['id']}, Status: {active_remediation.get('remediation_status')}")
+        logger.info(f"[WEBHOOK-BLOCK] Incoming webhook run_id: {runid}")
+        logger.info(f"[WEBHOOK-BLOCK] Ticket created: {active_remediation.get('timestamp')}, Attempts: {active_remediation.get('remediation_attempts', 0)}")
+        logger.info(f"[WEBHOOK-BLOCK] Reason: Preventing infinite loop - callback will handle retries")
 
-        # This webhook is likely for a remediation retry failure
-        # DO NOT create new ticket - callback will handle it
+        # ALWAYS block ALL webhooks during active remediation
+        # This prevents infinite loops when remediation attempts fail and trigger new alerts
         log_audit(
             ticket_id=active_remediation['id'],
-            action="webhook_ignored_during_remediation",
+            action="webhook_blocked_during_remediation",
             pipeline=pipeline,
             run_id=runid,
-            details=f"Webhook received during active remediation. Callback will handle retry logic. Remediation attempts: {active_remediation.get('remediation_attempts', 0)}"
+            details=f"Webhook BLOCKED to prevent infinite loop. Active ticket: {active_remediation['id']}, Status: {active_remediation.get('remediation_status')}, Attempts: {active_remediation.get('remediation_attempts', 0)}. Callback mechanism will handle all retries."
         )
 
         return JSONResponse({
-            "status": "ignored_during_remediation",
+            "status": "blocked_during_remediation",
             "ticket_id": active_remediation['id'],
-            "message": "Active remediation in progress - callback will handle retry logic",
-            "remediation_attempts": active_remediation.get('remediation_attempts', 0)
+            "message": f"Webhook blocked - active remediation in progress. Callback will handle retry logic.",
+            "remediation_status": active_remediation.get('remediation_status'),
+            "remediation_attempts": active_remediation.get('remediation_attempts', 0),
+            "active_ticket_created": active_remediation.get('timestamp')
         })
 
     finops_tags = extract_finops_tags(pipeline)

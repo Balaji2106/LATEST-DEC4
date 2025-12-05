@@ -74,6 +74,13 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # --- Auto-Remediation Config ---
 AUTO_REMEDIATION_ENABLED = os.getenv("AUTO_REMEDIATION_ENABLED", "false").lower() in ("1", "true", "yes")
 
+# Circuit Breaker Configuration - Prevents system overload
+# Maximum concurrent remediations allowed globally (0 = unlimited)
+MAX_CONCURRENT_REMEDIATIONS = int(os.getenv("MAX_CONCURRENT_REMEDIATIONS", "10"))
+
+# Pipeline cooldown period after exhausted retries (minutes)
+PIPELINE_COOLDOWN_MINUTES = int(os.getenv("PIPELINE_COOLDOWN_MINUTES", "30"))
+
 # --- Azure Blob Storage Config ---
 AZURE_STORAGE_CONN = os.getenv("AZURE_STORAGE_CONN")
 AZURE_BLOB_CONTAINER_NAME = os.getenv("AZURE_BLOB_CONTAINER_NAME", "audit-logs")
@@ -1234,6 +1241,23 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
     """
     logger.info(f"[AUTO-REM] Triggering auto-remediation for {ticket_id}, error: {error_type}, attempt: {attempt_number}")
 
+    # Circuit Breaker: Check maximum concurrent remediations
+    if MAX_CONCURRENT_REMEDIATIONS > 0:
+        active_count = db_query("""
+            SELECT COUNT(*) as count FROM tickets
+            WHERE remediation_status IN ('pending', 'in_progress', 'awaiting_approval')
+            AND timestamp > datetime('now', '-2 hours')
+        """, {}, one=True)
+
+        if active_count and active_count['count'] >= MAX_CONCURRENT_REMEDIATIONS:
+            logger.warning(f"[AUTO-REM] Circuit breaker triggered: {active_count['count']} active remediations >= limit {MAX_CONCURRENT_REMEDIATIONS}")
+            log_audit(
+                ticket_id=ticket_id, action="remediation_circuit_breaker",
+                pipeline=pipeline_name, run_id=original_run_id,
+                details=f"Auto-remediation blocked by circuit breaker. Active remediations: {active_count['count']}/{MAX_CONCURRENT_REMEDIATIONS}"
+            )
+            return {"success": False, "message": f"Circuit breaker: Too many concurrent remediations ({active_count['count']}/{MAX_CONCURRENT_REMEDIATIONS})"}
+
     # Check if error is remediable
     if error_type not in REMEDIABLE_ERRORS:
         logger.info(f"[AUTO-REM] Error type {error_type} is not auto-remediable")
@@ -2341,7 +2365,28 @@ async def azure_monitor(request: Request):
 
     logger.info("ADF Error being sent to Gemini:\n%s", desc[:500])
 
-    # ** ENHANCED DEDUPLICATION CHECK **
+    # ============================================================================
+    # ** ENHANCED DEDUPLICATION & LOOP PREVENTION **
+    # ============================================================================
+    # This multi-layer protection prevents infinite loops and ticket spam when:
+    # - Pipelines fail repeatedly
+    # - Auto-remediation retries fail and trigger new Azure Monitor alerts
+    # - Multiple alerts arrive for the same failure
+    #
+    # Protection Layers:
+    # 1. Exact run_id deduplication (original failures)
+    # 2. Remediation run_id tracking (retry failures)
+    # 3. Active remediation detection (concurrent processing)
+    # 4. Cooldown period enforcement (exhausted retries)
+    #
+    # This ensures:
+    # - No duplicate tickets for the same pipeline run
+    # - Retry failures don't create new tickets (callback handles them)
+    # - Failed pipelines get proper retry attempts with exponential backoff
+    # - After max retries exhausted, pipeline enters 30-min cooldown
+    # - Manual intervention required after cooldown before new auto-remediation
+    # ============================================================================
+
     # Check 1: Exact run_id match (original failure OR remediation attempt already has ticket)
     if runid:
         # Check if run_id matches original failure
@@ -2423,6 +2468,40 @@ async def azure_monitor(request: Request):
             "ticket_id": active_remediation['id'],
             "message": "Active remediation in progress - callback will handle retry logic",
             "remediation_attempts": active_remediation.get('remediation_attempts', 0)
+        })
+
+    # Check 3: Pipeline in cooldown after exhausted retries (prevent spam after failure)
+    # If a pipeline recently exhausted all retries, don't create new tickets during cooldown period
+    exhausted_ticket = db_query(f"""
+        SELECT id, remediation_exhausted_at, remediation_attempts
+        FROM tickets
+        WHERE pipeline = :pipeline
+        AND remediation_status = 'applied_not_solved'
+        AND remediation_exhausted_at > datetime('now', '-{PIPELINE_COOLDOWN_MINUTES} minutes')
+        ORDER BY remediation_exhausted_at DESC
+        LIMIT 1
+    """, {"pipeline": pipeline}, one=True)
+
+    if exhausted_ticket:
+        logger.warning(f"[WEBHOOK-DEDUP] Pipeline {pipeline} is in cooldown period after exhausted retries")
+        logger.warning(f"[WEBHOOK-DEDUP] Original ticket: {exhausted_ticket['id']}, Attempts: {exhausted_ticket.get('remediation_attempts', 0)}")
+        logger.warning(f"[WEBHOOK-DEDUP] Cooldown until: {exhausted_ticket.get('remediation_exhausted_at')} + {PIPELINE_COOLDOWN_MINUTES} minutes")
+
+        log_audit(
+            ticket_id=exhausted_ticket['id'],
+            action="webhook_ignored_cooldown",
+            pipeline=pipeline,
+            run_id=runid,
+            details=f"New failure ignored during {PIPELINE_COOLDOWN_MINUTES}-min cooldown period. Pipeline {pipeline} exhausted all retries recently. Manual intervention required before new auto-remediation attempts."
+        )
+
+        return JSONResponse({
+            "status": "ignored_cooldown",
+            "ticket_id": exhausted_ticket['id'],
+            "message": f"Pipeline in {PIPELINE_COOLDOWN_MINUTES}-min cooldown after exhausting retries. Manual fix required.",
+            "exhausted_at": exhausted_ticket.get('remediation_exhausted_at'),
+            "original_attempts": exhausted_ticket.get('remediation_attempts', 0),
+            "cooldown_minutes": PIPELINE_COOLDOWN_MINUTES
         })
 
     finops_tags = extract_finops_tags(pipeline)
@@ -3159,6 +3238,88 @@ async def api_remediation_failed_tickets(current_user: dict = Depends(get_curren
             except Exception:
                 r["recommendations"] = [r["recommendations"]]
     return {"tickets": rows}
+
+@app.get("/api/remediation-health")
+async def api_remediation_health(current_user: dict = Depends(get_current_user)):
+    """
+    Get auto-remediation health statistics and circuit breaker status
+    Useful for monitoring and detecting loop issues
+    """
+    # Get active remediation count
+    active = db_query("""
+        SELECT COUNT(*) as count FROM tickets
+        WHERE remediation_status IN ('pending', 'in_progress', 'awaiting_approval')
+        AND timestamp > datetime('now', '-2 hours')
+    """, {}, one=True)
+    active_count = active['count'] if active else 0
+
+    # Get recent remediation attempts (last 24 hours)
+    recent_attempts = db_query("""
+        SELECT
+            COUNT(*) as total_attempts,
+            SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) as succeeded,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+            SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress
+        FROM remediation_attempts
+        WHERE started_at > datetime('now', '-24 hours')
+    """, {}, one=True)
+
+    # Get pipelines in cooldown
+    cooldown_pipelines = db_query(f"""
+        SELECT pipeline, id, remediation_attempts, remediation_exhausted_at
+        FROM tickets
+        WHERE remediation_status = 'applied_not_solved'
+        AND remediation_exhausted_at > datetime('now', '-{PIPELINE_COOLDOWN_MINUTES} minutes')
+        ORDER BY remediation_exhausted_at DESC
+    """)
+
+    # Calculate success rate
+    total_attempts = recent_attempts['total_attempts'] if recent_attempts else 0
+    succeeded = recent_attempts['succeeded'] if recent_attempts else 0
+    success_rate = round((succeeded / total_attempts * 100), 2) if total_attempts > 0 else 0
+
+    # Circuit breaker status
+    circuit_breaker_active = False
+    if MAX_CONCURRENT_REMEDIATIONS > 0 and active_count >= MAX_CONCURRENT_REMEDIATIONS:
+        circuit_breaker_active = True
+
+    # Get recent webhook ignores (last hour) - indicators of potential loops
+    webhook_ignores = db_query("""
+        SELECT COUNT(*) as count FROM audit_trail
+        WHERE action IN ('remediation_retry_webhook_ignored', 'webhook_ignored_during_remediation', 'webhook_ignored_cooldown')
+        AND timestamp > datetime('now', '-1 hour')
+    """, {}, one=True)
+
+    return {
+        "status": "healthy" if not circuit_breaker_active and success_rate > 50 else "degraded" if success_rate > 20 else "critical",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "active_remediations": {
+            "count": active_count,
+            "limit": MAX_CONCURRENT_REMEDIATIONS,
+            "utilization_pct": round((active_count / MAX_CONCURRENT_REMEDIATIONS * 100), 2) if MAX_CONCURRENT_REMEDIATIONS > 0 else 0
+        },
+        "circuit_breaker": {
+            "active": circuit_breaker_active,
+            "threshold": MAX_CONCURRENT_REMEDIATIONS
+        },
+        "last_24h_stats": {
+            "total_attempts": total_attempts,
+            "succeeded": succeeded,
+            "failed": recent_attempts['failed'] if recent_attempts else 0,
+            "in_progress": recent_attempts['in_progress'] if recent_attempts else 0,
+            "success_rate_pct": success_rate
+        },
+        "cooldown": {
+            "pipelines_count": len(cooldown_pipelines),
+            "cooldown_minutes": PIPELINE_COOLDOWN_MINUTES,
+            "pipelines": [{"pipeline": p['pipeline'], "ticket_id": p['id'], "attempts": p['remediation_attempts']}
+                         for p in cooldown_pipelines]
+        },
+        "loop_prevention": {
+            "webhooks_ignored_last_hour": webhook_ignores['count'] if webhook_ignores else 0,
+            "description": "Webhooks ignored are retry failures properly caught by loop prevention"
+        }
+    }
 
 @app.get("/api/summary")
 async def api_summary(current_user: dict = Depends(get_current_user)):

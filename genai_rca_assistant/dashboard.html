@@ -130,6 +130,22 @@
     <button class="btn-download" onclick="downloadCurrentTab()">Download CSV</button>
   </div>
 
+  <!-- REMEDIATION HEALTH STATUS -->
+  <div id="remediation-health-banner" style="margin-top:15px;padding:12px;background:#161b22;border-radius:8px;border:1px solid #30363d;display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+      <div>
+        <span style="font-weight:600;color:#79c0ff">Auto-Remediation Health:</span>
+        <span id="health-status-badge" style="margin-left:8px;padding:4px 10px;border-radius:6px;font-weight:600"></span>
+        <span id="health-success-rate" style="margin-left:12px;color:#9aa6b2;font-size:13px"></span>
+      </div>
+      <div style="display:flex;gap:15px;font-size:13px">
+        <span><span style="color:#9aa6b2">Active:</span> <span id="health-active-count" style="color:#58a6ff;font-weight:600">-</span></span>
+        <span><span style="color:#9aa6b2">Cooldown:</span> <span id="health-cooldown-count" style="color:#d29922;font-weight:600">-</span></span>
+        <span><span style="color:#9aa6b2">Circuit Breaker:</span> <span id="health-circuit-status" style="font-weight:600">-</span></span>
+      </div>
+    </div>
+  </div>
+
   <div class="search-container">
       <input type="text" id="ticket-search" placeholder="Search by Ticket ID, Pipeline, RCA, or ITSM ID..." onkeyup="filterTickets()" />
   </div>
@@ -328,8 +344,57 @@ async function fetchRemediationFailed(){
   }
 }
 
+async function fetchRemediationHealth(){
+  try{
+    const res=await fetchWithAuth('/api/remediation-health');
+    if (!res) return;
+    const health=await res.json();
+
+    // Show the health banner
+    const banner = document.getElementById('remediation-health-banner');
+    banner.style.display = 'block';
+
+    // Update status badge
+    const statusBadge = document.getElementById('health-status-badge');
+    const status = health.status || 'unknown';
+    statusBadge.innerText = status.toUpperCase();
+    if (status === 'healthy') {
+      statusBadge.style.background = '#2ea043';
+      statusBadge.style.color = '#fff';
+    } else if (status === 'degraded') {
+      statusBadge.style.background = '#d29922';
+      statusBadge.style.color = '#000';
+    } else {
+      statusBadge.style.background = '#da3633';
+      statusBadge.style.color = '#fff';
+    }
+
+    // Update success rate
+    const successRate = health.last_24h_stats?.success_rate_pct || 0;
+    document.getElementById('health-success-rate').innerText =
+      `Success Rate (24h): ${successRate}%`;
+
+    // Update metrics
+    document.getElementById('health-active-count').innerText =
+      `${health.active_remediations?.count || 0}/${health.active_remediations?.limit || 0}`;
+
+    document.getElementById('health-cooldown-count').innerText =
+      health.cooldown?.pipelines_count || 0;
+
+    const circuitStatus = document.getElementById('health-circuit-status');
+    const isActive = health.circuit_breaker?.active;
+    circuitStatus.innerText = isActive ? 'ACTIVE' : 'Normal';
+    circuitStatus.style.color = isActive ? '#f85149' : '#2ea043';
+
+  }catch(e){
+    console.error('Failed to fetch remediation health:', e);
+    // Hide banner on error
+    document.getElementById('remediation-health-banner').style.display = 'none';
+  }
+}
+
 async function refreshAll(){
-  await Promise.all([fetchOpen(), fetchInProgress(), fetchClosed(), fetchRemediationFailed()]);
+  await Promise.all([fetchOpen(), fetchInProgress(), fetchClosed(), fetchRemediationFailed(), fetchRemediationHealth()]);
   // Combine all tickets for filtering/modal view
   allTickets = [...openTickets, ...inProgressTickets, ...closedTickets, ...remediationFailedTickets];
   render();

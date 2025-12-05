@@ -2342,8 +2342,9 @@ async def azure_monitor(request: Request):
     logger.info("ADF Error being sent to Gemini:\n%s", desc[:500])
 
     # ** ENHANCED DEDUPLICATION CHECK **
-    # Check 1: Exact run_id match (original failure already has ticket)
+    # Check 1: Exact run_id match (original failure OR remediation attempt already has ticket)
     if runid:
+        # Check if run_id matches original failure
         existing = db_query("SELECT id, status FROM tickets WHERE run_id = :run_id",
                            {"run_id": runid}, one=True)
         if existing:
@@ -2360,6 +2361,35 @@ async def azure_monitor(request: Request):
                 "ticket_id": existing["id"],
                 "message": f"Ticket already exists for run_id {runid}",
                 "existing_status": existing.get("status")
+            })
+
+        # Check if run_id matches a remediation attempt (retry failure)
+        remediation_match = db_query("""
+            SELECT ra.ticket_id, ra.attempt_number, t.status, t.remediation_status
+            FROM remediation_attempts ra
+            JOIN tickets t ON ra.ticket_id = t.id
+            WHERE ra.remediation_run_id = :run_id
+            ORDER BY ra.started_at DESC
+            LIMIT 1
+        """, {"run_id": runid}, one=True)
+
+        if remediation_match:
+            ticket_id = remediation_match['ticket_id']
+            attempt_num = remediation_match['attempt_number']
+            logger.warning(f"[WEBHOOK-DEDUP] Remediation retry failure detected: run_id {runid} is attempt #{attempt_num} for ticket {ticket_id}")
+            log_audit(
+                ticket_id=ticket_id,
+                action="remediation_retry_webhook_ignored",
+                pipeline=pipeline,
+                run_id=runid,
+                details=f"Webhook for remediation attempt #{attempt_num} ignored - already tracked. Callback will handle retry logic."
+            )
+            return JSONResponse({
+                "status": "remediation_retry_ignored",
+                "ticket_id": ticket_id,
+                "message": f"Remediation attempt #{attempt_num} already tracked - callback will handle",
+                "attempt_number": attempt_num,
+                "existing_status": remediation_match.get("status")
             })
 
     # Check 2: Active remediation in progress for this pipeline (retry failure)

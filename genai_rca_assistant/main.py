@@ -3113,6 +3113,23 @@ async def api_closed_tickets(current_user: dict = Depends(get_current_user)):
                 r["recommendations"] = [r["recommendations"]]
     return {"tickets": rows}
 
+@app.get("/api/remediation-failed-tickets")
+async def api_remediation_failed_tickets(current_user: dict = Depends(get_current_user)):
+    """Get tickets where auto-remediation failed after max retries"""
+    columns = _get_ticket_columns()
+    rows = db_query(f"""
+        SELECT {columns} FROM tickets
+        WHERE remediation_status = 'applied_not_solved'
+        ORDER BY timestamp DESC
+    """)
+    for r in rows:
+        if isinstance(r.get("recommendations"), str):
+            try:
+                r["recommendations"] = json.loads(r["recommendations"]) if r.get("recommendations") else []
+            except Exception:
+                r["recommendations"] = [r["recommendations"]]
+    return {"tickets": rows}
+
 @app.get("/api/summary")
 async def api_summary(current_user: dict = Depends(get_current_user)):
     tickets = db_query("SELECT * FROM tickets")
@@ -3240,19 +3257,39 @@ async def export_in_progress_tickets(current_user: dict = Depends(get_current_us
 async def export_closed_tickets(current_user: dict = Depends(get_current_user)):
     columns = _get_ticket_columns()
     rows = db_query(f"SELECT {columns} FROM tickets WHERE status = 'acknowledged' ORDER BY ack_ts DESC")
-    
+
     output = StringIO()
     if rows:
         fieldnames = list(rows[0].keys())
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    
+
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=closed_tickets_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"}
+    )
+
+@app.get("/api/export/remediation-failed-tickets")
+async def export_remediation_failed_tickets(current_user: dict = Depends(get_current_user)):
+    """Export tickets where auto-remediation failed after max retries"""
+    columns = _get_ticket_columns()
+    rows = db_query(f"SELECT {columns} FROM tickets WHERE remediation_status = 'applied_not_solved' ORDER BY timestamp DESC")
+
+    output = StringIO()
+    if rows:
+        fieldnames = list(rows[0].keys())
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=remediation_failed_tickets_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"}
     )
 
 @app.get("/api/export/audit-trail")

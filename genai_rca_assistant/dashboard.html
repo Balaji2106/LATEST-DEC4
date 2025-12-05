@@ -121,11 +121,12 @@
 <div class="board" id="dashboard-section">
   <div class="muted-top" id="last-updated"></div>
   
-  <!-- 3-TAB NAVIGATION -->
+  <!-- 4-TAB NAVIGATION -->
   <div class="tabs" style="align-items:center">
     <div id="tab-open" class="tab active" onclick="switchTab('open')">Open <span class="counts" id="count-open"></span></div>
     <div id="tab-in-progress" class="tab" onclick="switchTab('in_progress')">In Progress <span class="counts" id="count-in-progress"></span></div>
     <div id="tab-closed" class="tab" onclick="switchTab('closed')">Closed <span class="counts" id="count-closed"></span></div>
+    <div id="tab-remediation-failed" class="tab" onclick="switchTab('remediation_failed')">Remediation Failed <span class="counts" id="count-remediation-failed"></span></div>
     <button class="btn-download" onclick="downloadCurrentTab()">Download CSV</button>
   </div>
 
@@ -194,7 +195,7 @@
 </div>
 
 <script>
-let allTickets = [], openTickets = [], inProgressTickets = [], closedTickets = [], selected = null;
+let allTickets = [], openTickets = [], inProgressTickets = [], closedTickets = [], remediationFailedTickets = [], selected = null;
 let currentTab = 'open';
 let auditData = [];
 let appConfig = { itsm_tool: "none", jira_domain: "" };
@@ -314,10 +315,23 @@ async function fetchClosed(){
   }
 }
 
+async function fetchRemediationFailed(){
+  try{
+    const res=await fetchWithAuth('/api/remediation-failed-tickets');
+    if (!res) return;
+    const data=await res.json();
+    remediationFailedTickets=data.tickets||[];
+    document.getElementById('count-remediation-failed').innerText=`(${remediationFailedTickets.length})`;
+  }catch(e){
+    remediationFailedTickets=[];
+    document.getElementById('count-remediation-failed').innerText=`(0)`;
+  }
+}
+
 async function refreshAll(){
-  await Promise.all([fetchOpen(), fetchInProgress(), fetchClosed()]);
+  await Promise.all([fetchOpen(), fetchInProgress(), fetchClosed(), fetchRemediationFailed()]);
   // Combine all tickets for filtering/modal view
-  allTickets = [...openTickets, ...inProgressTickets, ...closedTickets];
+  allTickets = [...openTickets, ...inProgressTickets, ...closedTickets, ...remediationFailedTickets];
   render();
   document.getElementById('last-updated').innerText = `Last updated: ${new Date().toLocaleString()}`;
 }
@@ -329,10 +343,12 @@ function switchTab(tab){
   document.getElementById('tab-open').classList.toggle('active', tab==='open');
   document.getElementById('tab-in-progress').classList.toggle('active', tab==='in_progress');
   document.getElementById('tab-closed').classList.toggle('active', tab==='closed');
+  document.getElementById('tab-remediation-failed').classList.toggle('active', tab==='remediation_failed');
 
   if (tab === 'open') document.getElementById('section-title').innerText = 'Open Tickets';
   else if (tab === 'in_progress') document.getElementById('section-title').innerText = 'In Progress Tickets';
   else if (tab === 'closed') document.getElementById('section-title').innerText = 'Closed Tickets';
+  else if (tab === 'remediation_failed') document.getElementById('section-title').innerText = 'Remediation Failed Tickets';
 
   render();
 }
@@ -343,11 +359,12 @@ function render(){
   const el=document.getElementById('tickets');
   el.innerHTML='';
   const searchInput=document.getElementById('ticket-search').value.toLowerCase();
-  
+
   let list = [];
   if (currentTab === 'open') list = openTickets;
   else if (currentTab === 'in_progress') list = inProgressTickets;
   else if (currentTab === 'closed') list = closedTickets;
+  else if (currentTab === 'remediation_failed') list = remediationFailedTickets;
 
   // Sort logic
   list.sort((a,b)=>{
@@ -629,6 +646,8 @@ async function downloadCurrentTab() {
   let endpoint;
   if (currentTab === 'open') endpoint = '/api/export/open-tickets';
   else if (currentTab === 'in_progress') endpoint = '/api/export/in-progress-tickets';
+  else if (currentTab === 'closed') endpoint = '/api/export/closed-tickets';
+  else if (currentTab === 'remediation_failed') endpoint = '/api/export/remediation-failed-tickets';
   else endpoint = '/api/export/closed-tickets';
 
   try {

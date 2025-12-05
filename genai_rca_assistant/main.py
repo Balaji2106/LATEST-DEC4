@@ -3385,6 +3385,153 @@ async def webhook_jira(request: Request):
             
     return JSONResponse({"status": "ignored", "event": event})
 
+# --- SLACK INTERACTIONS WEBHOOK ---
+@app.post("/slack/interactions")
+async def slack_interactions(request: Request):
+    """
+    Handles Slack button clicks for approval/rejection of auto-remediation.
+    Slack sends interactions as form-urlencoded data, not JSON.
+    """
+    try:
+        # Slack sends the payload as form-urlencoded with a 'payload' field containing JSON
+        form_data = await request.form()
+        payload_str = form_data.get("payload")
+
+        if not payload_str:
+            logger.error("[SLACK-INTERACTION] No payload in request")
+            return JSONResponse({"error": "No payload"}, status_code=400)
+
+        payload = json.loads(payload_str)
+
+        # Extract action information
+        action_type = payload.get("type")  # Should be "block_actions"
+        user = payload.get("user", {})
+        user_name = user.get("name", "unknown")
+
+        actions = payload.get("actions", [])
+        if not actions:
+            return JSONResponse({"text": "No action received"})
+
+        action = actions[0]
+        action_id = action.get("action_id")  # "approve_remediation" or "reject_remediation"
+        action_value = action.get("value")  # "approve_TICKET-ID_ACTION" or "reject_TICKET-ID"
+
+        logger.info(f"[SLACK-INTERACTION] Received action: {action_id}, value: {action_value}, user: {user_name}")
+
+        # Parse the value to extract ticket ID and action
+        if action_id == "approve_remediation":
+            # Value format: approve_TICKET-ID_ACTION
+            parts = action_value.split("_", 2)  # Split into ['approve', 'TICKET-ID', 'ACTION']
+            if len(parts) >= 2:
+                ticket_id = parts[1]
+                remediation_action = parts[2] if len(parts) > 2 else "retry_pipeline"
+
+                logger.info(f"[SLACK-INTERACTION] Approving remediation for ticket: {ticket_id}")
+
+                # Get ticket details
+                ticket = db_query("SELECT * FROM tickets WHERE id = :id", {"id": ticket_id}, one=True)
+                if not ticket:
+                    return JSONResponse({"text": f"❌ Ticket {ticket_id} not found"})
+
+                # Update ticket status
+                db_execute("""UPDATE tickets
+                             SET remediation_status = :status
+                             WHERE id = :id""",
+                          {"status": "in_progress", "id": ticket_id})
+
+                # Log approval
+                log_audit(
+                    ticket_id=ticket_id,
+                    action="approval_granted",
+                    pipeline=ticket.get("pipeline"),
+                    run_id=ticket.get("run_id"),
+                    user_name=user_name,
+                    details=f"User {user_name} approved auto-remediation via Slack"
+                )
+
+                # Trigger auto-remediation
+                pipeline_name = ticket.get("pipeline")
+                error_type = ticket.get("error_type")
+                original_run_id = ticket.get("run_id")
+
+                # Trigger in background
+                asyncio.create_task(trigger_auto_remediation(
+                    ticket_id=ticket_id,
+                    pipeline_name=pipeline_name,
+                    error_type=error_type,
+                    original_run_id=original_run_id,
+                    run_data={},
+                    attempt_number=1
+                ))
+
+                # Update Slack message
+                response_message = {
+                    "text": f"✅ Auto-remediation approved by {user_name}",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"✅ *Auto-remediation approved by {user_name}*\n\nRetrying pipeline: `{pipeline_name}`\nTicket: `{ticket_id}`"
+                            }
+                        }
+                    ],
+                    "replace_original": True
+                }
+
+                return JSONResponse(response_message)
+
+        elif action_id == "reject_remediation":
+            # Value format: reject_TICKET-ID
+            ticket_id = action_value.replace("reject_", "")
+
+            logger.info(f"[SLACK-INTERACTION] Rejecting remediation for ticket: {ticket_id}")
+
+            # Get ticket details
+            ticket = db_query("SELECT * FROM tickets WHERE id = :id", {"id": ticket_id}, one=True)
+            if not ticket:
+                return JSONResponse({"text": f"❌ Ticket {ticket_id} not found"})
+
+            # Update ticket status
+            db_execute("""UPDATE tickets
+                         SET remediation_status = :status
+                         WHERE id = :id""",
+                      {"status": "rejected", "id": ticket_id})
+
+            # Log rejection
+            log_audit(
+                ticket_id=ticket_id,
+                action="approval_rejected",
+                pipeline=ticket.get("pipeline"),
+                run_id=ticket.get("run_id"),
+                user_name=user_name,
+                details=f"User {user_name} rejected auto-remediation via Slack - requires manual intervention"
+            )
+
+            # Update Slack message
+            response_message = {
+                "text": f"❌ Auto-remediation rejected by {user_name}",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"❌ *Auto-remediation rejected by {user_name}*\n\nTicket: `{ticket_id}` requires manual intervention.\nPipeline: `{ticket.get('pipeline')}`"
+                        }
+                    }
+                ],
+                "replace_original": True
+            }
+
+            return JSONResponse(response_message)
+
+        # Unknown action
+        return JSONResponse({"text": "Unknown action"})
+
+    except Exception as e:
+        logger.exception(f"[SLACK-INTERACTION] Error processing interaction: {e}")
+        return JSONResponse({"text": f"❌ Error: {str(e)}"}, status_code=500)
+
 # --- WebSocket ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

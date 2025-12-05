@@ -332,7 +332,8 @@ def init_db():
             "remediation_status": "TEXT",
             "remediation_run_id": "TEXT",
             "remediation_attempts": "INTEGER DEFAULT 0",
-            "remediation_last_attempt_at": "TEXT"
+            "remediation_last_attempt_at": "TEXT",
+            "remediation_approval_requested_at": "TEXT"
         }
         
         for col, col_type in migration_columns.items():
@@ -2366,7 +2367,7 @@ async def azure_monitor(request: Request):
         SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id
         FROM tickets
         WHERE pipeline = :pipeline
-        AND remediation_status IN ('in_progress', 'awaiting_approval')
+        AND remediation_status IN ('pending', 'in_progress', 'awaiting_approval')
         AND timestamp > datetime('now', '-20 minutes')
         ORDER BY timestamp DESC
         LIMIT 1
@@ -2425,16 +2426,19 @@ async def azure_monitor(request: Request):
         logic_app_run_id=logic_app_run_id, processing_mode=processing_mode
     )
     
+    # Set initial remediation_status to prevent race conditions during deduplication
+    ticket_data["remediation_status"] = "pending"  # Will be updated to 'awaiting_approval' or 'in_progress' later
+
     try:
         db_execute("""
         INSERT INTO tickets (id, timestamp, pipeline, run_id, rca_result, recommendations, confidence, severity, priority,
-                             error_type, affected_entity, status, sla_seconds, sla_status, 
+                             error_type, affected_entity, status, sla_seconds, sla_status,
                              finops_team, finops_owner, finops_cost_center, blob_log_url, itsm_ticket_id,
-                             logic_app_run_id, processing_mode)
+                             logic_app_run_id, processing_mode, remediation_status)
         VALUES (:id, :timestamp, :pipeline, :run_id, :rca_result, :recommendations, :confidence, :severity, :priority,
-                :error_type, :affected_entity, :status, :sla_seconds, :sla_status, 
+                :error_type, :affected_entity, :status, :sla_seconds, :sla_status,
                 :finops_team, :finops_owner, :finops_cost_center, :blob_log_url, :itsm_ticket_id,
-                :logic_app_run_id, :processing_mode)
+                :logic_app_run_id, :processing_mode, :remediation_status)
         """, ticket_data)
         logger.info("RCA stored in DB for %s (run_id: %s)", tid, runid)
     except Exception as e:

@@ -3460,7 +3460,6 @@ async def slack_interactions(request: Request):
                     pipeline_name=pipeline_name,
                     error_type=error_type,
                     original_run_id=original_run_id,
-                    run_data={},
                     attempt_number=1
                 ))
 

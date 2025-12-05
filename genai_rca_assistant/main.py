@@ -2362,7 +2362,43 @@ async def azure_monitor(request: Request):
                 "existing_status": existing.get("status")
             })
 
-    # Check 2: Active remediation in progress for this pipeline
+    # ===================================================================
+    # STEP 1: Auto-cleanup stuck tickets FIRST (before blocking check)
+    # ===================================================================
+    # Check for stuck tickets that are older than 15 minutes but still in remediation status
+    # Update them to a failed state so they stop blocking
+    # This MUST run BEFORE the blocking check, otherwise stuck tickets block forever!
+    stuck_tickets = db_query("""
+        SELECT id, remediation_status, timestamp
+        FROM tickets
+        WHERE pipeline = :pipeline
+        AND remediation_status IN ('awaiting_approval', 'in_progress')
+        AND timestamp <= datetime('now', '-15 minutes')
+    """, {"pipeline": pipeline})
+
+    if stuck_tickets:
+        for stuck_ticket in stuck_tickets:
+            logger.warning(f"[WEBHOOK-CLEANUP] Found stuck ticket: {stuck_ticket['id']}, Status: {stuck_ticket['remediation_status']}, Age: {stuck_ticket['timestamp']}")
+            db_execute("""
+                UPDATE tickets
+                SET remediation_status = 'applied_not_solved',
+                    status = 'in_progress'
+                WHERE id = :id
+            """, {"id": stuck_ticket['id']})
+
+            log_audit(
+                ticket_id=stuck_ticket['id'],
+                action="stuck_ticket_auto_failed",
+                pipeline=pipeline,
+                run_id=runid,
+                details=f"Ticket stuck in '{stuck_ticket['remediation_status']}' for >15 minutes. Auto-marked as 'applied_not_solved'."
+            )
+
+        logger.warning(f"[WEBHOOK-CLEANUP] Cleaned up {len(stuck_tickets)} stuck tickets for pipeline {pipeline}")
+
+    # ===================================================================
+    # STEP 2: Check for active remediation (AFTER cleanup)
+    # ===================================================================
     # CRITICAL: During active remediation, BLOCK ALL webhooks to prevent infinite loops
     #
     # Flow explanation:
@@ -2375,7 +2411,7 @@ async def azure_monitor(request: Request):
     #
     # Only block on 'awaiting_approval' and 'in_progress' (NOT 'pending')
     # Timeout: 15 minutes (reasonable time for approval + 3 retry attempts)
-    # After 15 minutes, stuck tickets no longer block new webhooks
+    # After 15 minutes, stuck tickets are cleaned up above and won't block
     active_remediation = db_query("""
         SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id, timestamp
         FROM tickets
@@ -2411,36 +2447,6 @@ async def azure_monitor(request: Request):
             "remediation_attempts": active_remediation.get('remediation_attempts', 0),
             "active_ticket_created": active_remediation.get('timestamp')
         })
-
-    # Check for stuck tickets that are older than 15 minutes but still in remediation status
-    # Update them to a failed state so they stop blocking
-    stuck_tickets = db_query("""
-        SELECT id, remediation_status, timestamp
-        FROM tickets
-        WHERE pipeline = :pipeline
-        AND remediation_status IN ('awaiting_approval', 'in_progress')
-        AND timestamp <= datetime('now', '-15 minutes')
-    """, {"pipeline": pipeline})
-
-    if stuck_tickets:
-        for stuck_ticket in stuck_tickets:
-            logger.warning(f"[WEBHOOK-CLEANUP] Found stuck ticket: {stuck_ticket['id']}, Status: {stuck_ticket['remediation_status']}, Age: {stuck_ticket['timestamp']}")
-            db_execute("""
-                UPDATE tickets
-                SET remediation_status = 'applied_not_solved',
-                    status = 'in_progress'
-                WHERE id = :id
-            """, {"id": stuck_ticket['id']})
-
-            log_audit(
-                ticket_id=stuck_ticket['id'],
-                action="stuck_ticket_auto_failed",
-                pipeline=pipeline,
-                run_id=runid,
-                details=f"Ticket stuck in '{stuck_ticket['remediation_status']}' for >15 minutes. Auto-marked as 'applied_not_solved'."
-            )
-
-        logger.warning(f"[WEBHOOK-CLEANUP] Cleaned up {len(stuck_tickets)} stuck tickets for pipeline {pipeline}")
 
     finops_tags = extract_finops_tags(pipeline)
     rca = generate_rca_and_recs(desc)

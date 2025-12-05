@@ -10,45 +10,23 @@
                     "schema": {
                         "type": "object",
                         "properties": {
-                            "pipeline_name": {
-                                "type": "string"
-                            },
-                            "ticket_id": {
-                                "type": "string"
-                            },
-                            "error_type": {
-                                "type": "string"
-                            },
-                            "original_run_id": {
-                                "type": "string"
-                            },
-                            "retry_attempt": {
-                                "type": "integer"
-                            },
-                            "max_retries": {
-                                "type": "integer"
-                            },
-                            "remediation_action": {
-                                "type": "string"
-                            },
-                            "timestamp": {
-                                "type": "string"
-                            },
-                            "callback_url": {
-                                "type": "string"
-                            }
+                            "pipeline_name": {"type": "string"},
+                            "ticket_id": {"type": "string"},
+                            "error_type": {"type": "string"},
+                            "original_run_id": {"type": "string"},
+                            "retry_attempt": {"type": "integer"},
+                            "max_retries": {"type": "integer"},
+                            "remediation_action": {"type": "string"},
+                            "timestamp": {"type": "string"},
+                            "callback_url": {"type": "string"}
                         },
-                        "required": [
-                            "pipeline_name",
-                            "ticket_id",
-                            "callback_url"
-                        ]
+                        "required": ["pipeline_name", "ticket_id", "callback_url"]
                     }
                 }
             }
         },
         "actions": {
-            "Initialize_PipelineStatus": {
+            "Initialize_Variables": {
                 "type": "InitializeVariable",
                 "inputs": {
                     "variables": [
@@ -56,32 +34,12 @@
                             "name": "PipelineStatus",
                             "type": "string",
                             "value": "InProgress"
-                        }
-                    ]
-                },
-                "runAfter": {}
-            },
-            "Initialize_RunId": {
-                "type": "InitializeVariable",
-                "inputs": {
-                    "variables": [
+                        },
                         {
                             "name": "RunId",
                             "type": "string",
                             "value": ""
-                        }
-                    ]
-                },
-                "runAfter": {
-                    "Initialize_PipelineStatus": [
-                        "Succeeded"
-                    ]
-                }
-            },
-            "Initialize_AttemptNumber": {
-                "type": "InitializeVariable",
-                "inputs": {
-                    "variables": [
+                        },
                         {
                             "name": "AttemptNumber",
                             "type": "integer",
@@ -89,11 +47,7 @@
                         }
                     ]
                 },
-                "runAfter": {
-                    "Initialize_RunId": [
-                        "Succeeded"
-                    ]
-                }
+                "runAfter": {}
             },
             "Create_a_pipeline_run": {
                 "type": "ApiConnection",
@@ -110,9 +64,7 @@
                     }
                 },
                 "runAfter": {
-                    "Initialize_AttemptNumber": [
-                        "Succeeded"
-                    ]
+                    "Initialize_Variables": ["Succeeded"]
                 }
             },
             "Set_RunId": {
@@ -122,31 +74,25 @@
                     "value": "@body('Create_a_pipeline_run')?['runId']"
                 },
                 "runAfter": {
-                    "Create_a_pipeline_run": [
-                        "Succeeded"
-                    ]
+                    "Create_a_pipeline_run": ["Succeeded"]
                 }
             },
             "Monitor_Pipeline_Until_Complete": {
                 "type": "Until",
-                "expression": "@or(or(equals(variables('PipelineStatus'), 'Succeeded'), equals(variables('PipelineStatus'), 'Failed')), equals(variables('PipelineStatus'), 'Cancelled'))",
+                "expression": "@or(or(or(equals(variables('PipelineStatus'), 'Succeeded'), equals(variables('PipelineStatus'), 'Failed')), equals(variables('PipelineStatus'), 'Cancelled')), equals(variables('PipelineStatus'), 'Canceled'))",
                 "limit": {
                     "count": 60,
                     "timeout": "PT1H"
                 },
                 "actions": {
                     "Get_Pipeline_Run_Status": {
-                        "type": "ApiConnection",
+                        "type": "Http",
                         "inputs": {
-                            "host": {
-                                "connection": {
-                                    "name": "@parameters('$connections')['azuredatafactory']['connectionId']"
-                                }
-                            },
-                            "method": "get",
-                            "path": "/subscriptions/@{encodeURIComponent('d28a053b-ed09-40dd-92d6-43401a2c9799')}/resourcegroups/@{encodeURIComponent('rg_techdemo_2025_Q4')}/providers/Microsoft.DataFactory/factories/@{encodeURIComponent('adf-techdemo-rca')}/pipelineruns/@{encodeURIComponent(variables('RunId'))}",
-                            "queries": {
-                                "x-ms-api-version": "2017-09-01-preview"
+                            "method": "GET",
+                            "uri": "https://management.azure.com/subscriptions/d28a053b-ed09-40dd-92d6-43401a2c9799/resourceGroups/rg_techdemo_2025_Q4/providers/Microsoft.DataFactory/factories/adf-techdemo-rca/pipelineruns/@{variables('RunId')}?api-version=2018-06-01",
+                            "authentication": {
+                                "type": "ManagedServiceIdentity",
+                                "audience": "https://management.azure.com"
                             }
                         },
                         "runAfter": {}
@@ -158,9 +104,7 @@
                             "value": "@body('Get_Pipeline_Run_Status')?['status']"
                         },
                         "runAfter": {
-                            "Get_Pipeline_Run_Status": [
-                                "Succeeded"
-                            ]
+                            "Get_Pipeline_Run_Status": ["Succeeded"]
                         }
                     },
                     "Delay_30_Seconds": {
@@ -172,16 +116,12 @@
                             }
                         },
                         "runAfter": {
-                            "Update_PipelineStatus": [
-                                "Succeeded"
-                            ]
+                            "Update_PipelineStatus": ["Succeeded"]
                         }
                     }
                 },
                 "runAfter": {
-                    "Set_RunId": [
-                        "Succeeded"
-                    ]
+                    "Set_RunId": ["Succeeded"]
                 }
             },
             "Check_Pipeline_Result": {
@@ -272,9 +212,7 @@
                     }
                 },
                 "runAfter": {
-                    "Monitor_Pipeline_Until_Complete": [
-                        "Succeeded"
-                    ]
+                    "Monitor_Pipeline_Until_Complete": ["Succeeded"]
                 }
             }
         },

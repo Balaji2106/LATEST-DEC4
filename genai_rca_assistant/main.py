@@ -2438,11 +2438,14 @@ async def azure_monitor(request: Request):
             })
 
     # Check 2: Active remediation in progress for this pipeline (retry failure)
+    # IMPORTANT: Only ignore if remediation is ACTUALLY running (in_progress with attempts > 0)
+    # Don't ignore new failures just because there's a pending/awaiting_approval ticket
     active_remediation = db_query("""
         SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id
         FROM tickets
         WHERE pipeline = :pipeline
-        AND remediation_status IN ('pending', 'in_progress', 'awaiting_approval')
+        AND remediation_status = 'in_progress'
+        AND remediation_attempts > 0
         AND timestamp > datetime('now', '-20 minutes')
         ORDER BY timestamp DESC
         LIMIT 1

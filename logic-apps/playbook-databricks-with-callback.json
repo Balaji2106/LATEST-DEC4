@@ -535,12 +535,7 @@
             "value": "https://adb-4063542298037379.19.azuredatabricks.net"
         },
         "databricks_token": {
-            "reference": {
-                "keyVault": {
-                    "id": "/subscriptions/YOUR-SUBSCRIPTION-ID/resourceGroups/YOUR-RG/providers/Microsoft.KeyVault/vaults/YOUR-KEYVAULT"
-                },
-                "secretName": "databricks-token"
-            }
+            "value": "YOUR_DATABRICKS_TOKEN_HERE"
         }
     }
 }

@@ -1259,7 +1259,9 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
             logger.info(f"[AUTO-REM] Waiting {delay}s before retry attempt {attempt_number}")
             await asyncio.sleep(delay)
 
-    # Prepare payload for Logic App
+    # Prepare payload for Logic App with callback URL
+    callback_url = f"{PUBLIC_BASE_URL.rstrip('/')}/api/remediation-callback"
+
     payload = {
         "pipeline_name": pipeline_name,
         "ticket_id": ticket_id,
@@ -1268,8 +1270,11 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
         "retry_attempt": attempt_number,
         "max_retries": remediation_config["max_retries"],
         "remediation_action": remediation_config["action"],
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "callback_url": callback_url  # Logic App will call this when complete
     }
+
+    logger.info(f"[AUTO-REM] Callback URL: {callback_url}")
 
     try:
         # Call Logic App
@@ -1323,11 +1328,9 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
             except Exception:
                 pass
 
-            # Start monitoring in background
-            asyncio.create_task(monitor_remediation_run(
-                ticket_id, pipeline_name, remediation_run_id,
-                original_run_id, error_type, attempt_number
-            ))
+            # NOTE: Logic App handles monitoring and will callback when complete
+            # No need for polling-based monitoring from RCA app
+            logger.info(f"[AUTO-REM] Logic App will monitor pipeline and callback to: {callback_url}")
 
             return {"success": True, "remediation_run_id": remediation_run_id}
         else:
@@ -1374,7 +1377,9 @@ async def trigger_databricks_remediation(ticket_id: str, job_name: str, job_id: 
             logger.info(f"[AUTO-REM-DBX] Waiting {delay}s before retry attempt {attempt_number}")
             await asyncio.sleep(delay)
 
-    # Prepare payload for Databricks Logic App
+    # Prepare payload for Databricks Logic App with callback URL
+    callback_url = f"{PUBLIC_BASE_URL.rstrip('/')}/api/remediation-callback"
+
     payload = {
         "job_name": job_name,
         "job_id": str(job_id) if job_id else None,
@@ -1385,8 +1390,11 @@ async def trigger_databricks_remediation(ticket_id: str, job_name: str, job_id: 
         "retry_attempt": attempt_number,
         "max_retries": remediation_config["max_retries"],
         "remediation_action": remediation_config["action"],
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "callback_url": callback_url  # Logic App will call this when complete
     }
+
+    logger.info(f"[AUTO-REM-DBX] Callback URL: {callback_url}")
 
     try:
         # Call Databricks Logic App
@@ -2332,7 +2340,8 @@ async def azure_monitor(request: Request):
 
     logger.info("ADF Error being sent to Gemini:\n%s", desc[:500])
 
-    # ** DEDUPLICATION CHECK**
+    # ** ENHANCED DEDUPLICATION CHECK **
+    # Check 1: Exact run_id match (original failure already has ticket)
     if runid:
         existing = db_query("SELECT id, status FROM tickets WHERE run_id = :run_id",
                            {"run_id": runid}, one=True)
@@ -2351,6 +2360,39 @@ async def azure_monitor(request: Request):
                 "message": f"Ticket already exists for run_id {runid}",
                 "existing_status": existing.get("status")
             })
+
+    # Check 2: Active remediation in progress for this pipeline (retry failure)
+    active_remediation = db_query("""
+        SELECT id, remediation_run_id, remediation_attempts, remediation_status, run_id
+        FROM tickets
+        WHERE pipeline = :pipeline
+        AND remediation_status IN ('in_progress', 'awaiting_approval')
+        AND timestamp > datetime('now', '-20 minutes')
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, {"pipeline": pipeline}, one=True)
+
+    if active_remediation:
+        logger.info(f"[WEBHOOK-DEDUP] Active remediation found for pipeline {pipeline}")
+        logger.info(f"[WEBHOOK-DEDUP] Ticket: {active_remediation['id']}, Attempts: {active_remediation.get('remediation_attempts', 0)}")
+        logger.info(f"[WEBHOOK-DEDUP] Webhook run_id: {runid}, Original ticket run_id: {active_remediation.get('run_id')}")
+
+        # This webhook is likely for a remediation retry failure
+        # DO NOT create new ticket - callback will handle it
+        log_audit(
+            ticket_id=active_remediation['id'],
+            action="webhook_ignored_during_remediation",
+            pipeline=pipeline,
+            run_id=runid,
+            details=f"Webhook received during active remediation. Callback will handle retry logic. Remediation attempts: {active_remediation.get('remediation_attempts', 0)}"
+        )
+
+        return JSONResponse({
+            "status": "ignored_during_remediation",
+            "ticket_id": active_remediation['id'],
+            "message": "Active remediation in progress - callback will handle retry logic",
+            "remediation_attempts": active_remediation.get('remediation_attempts', 0)
+        })
 
     finops_tags = extract_finops_tags(pipeline)
     rca = generate_rca_and_recs(desc)
@@ -2524,6 +2566,112 @@ async def azure_monitor(request: Request):
         "itsm_ticket_id": itsm_ticket_id,
         "message": "Ticket created successfully from Azure Monitor webhook"
     })
+
+
+###########################################################################################################################
+# REMEDIATION CALLBACK ENDPOINT (Called by Logic Apps when remediation completes)
+###########################################################################################################################
+
+@app.post("/api/remediation-callback")
+async def remediation_callback(request: Request):
+    """
+    Receives callback from Logic App when remediation completes.
+
+    This endpoint is called by Logic Apps after they:
+    1. Retry the pipeline/job
+    2. Monitor it until completion (Success/Failed)
+    3. Send result back here
+
+    NO AUTHENTICATION - Logic Apps don't support OAuth easily
+    Security: Keep callback URL secret, validate ticket_id exists
+    """
+    try:
+        body = await request.json()
+
+        ticket_id = body.get("ticket_id")
+        status = body.get("status")  # "Succeeded", "Failed", "SUCCESS", "FAILED", "Cancelled"
+        success = body.get("success", False)
+        attempt_number = body.get("attempt_number", 1)
+        remediation_run_id = body.get("remediation_run_id", "N/A")
+        pipeline_name = body.get("pipeline_name") or body.get("job_name", "Unknown")
+        error_type = body.get("error_type", "UnknownError")
+        error_message = body.get("error_message", "")
+        original_run_id = body.get("original_run_id", "N/A")
+
+        logger.info("=" * 80)
+        logger.info(f"[CALLBACK] Remediation callback received for ticket: {ticket_id}")
+        logger.info(f"[CALLBACK] Status: {status}, Success: {success}, Attempt: {attempt_number}")
+        logger.info(f"[CALLBACK] Pipeline: {pipeline_name}, Run ID: {remediation_run_id}")
+        logger.info("=" * 80)
+
+        # Validate ticket exists
+        ticket = db_query("SELECT * FROM tickets WHERE id = :id", {"id": ticket_id}, one=True)
+        if not ticket:
+            logger.error(f"[CALLBACK] Ticket {ticket_id} not found in database")
+            return JSONResponse({
+                "status": "error",
+                "message": f"Ticket {ticket_id} not found"
+            }, status_code=404)
+
+        # Normalize status (handle both ADF and Databricks formats)
+        is_success = success or status in ["Succeeded", "SUCCESS"]
+        is_failed = (not success) or status in ["Failed", "FAILED", "Cancelled", "CANCELED"]
+
+        if is_success:
+            # ✅ SUCCESS - Close ticket
+            logger.info(f"[CALLBACK] ✅ Remediation SUCCEEDED for {ticket_id}")
+
+            await handle_remediation_success(
+                ticket_id=ticket_id,
+                pipeline_name=pipeline_name,
+                remediation_run_id=remediation_run_id,
+                original_run_id=original_run_id,
+                attempt_number=attempt_number
+            )
+
+            return JSONResponse({
+                "status": "success",
+                "message": f"Ticket {ticket_id} closed successfully",
+                "ticket_id": ticket_id,
+                "action": "ticket_closed"
+            })
+
+        elif is_failed:
+            # ❌ FAILED - Retry or escalate
+            logger.warning(f"[CALLBACK] ❌ Remediation FAILED for {ticket_id}, attempt {attempt_number}")
+
+            await handle_remediation_failure(
+                ticket_id=ticket_id,
+                pipeline_name=pipeline_name,
+                remediation_run_id=remediation_run_id,
+                original_run_id=original_run_id,
+                error_type=error_type,
+                attempt_number=attempt_number,
+                run_data={"message": error_message or "Pipeline run failed", "status": status}
+            )
+
+            return JSONResponse({
+                "status": "retry_triggered",
+                "message": f"Remediation attempt {attempt_number} failed, retry logic initiated",
+                "ticket_id": ticket_id,
+                "action": "retry_or_escalate"
+            })
+
+        else:
+            # Unknown status
+            logger.warning(f"[CALLBACK] Unknown status '{status}' for {ticket_id}")
+            return JSONResponse({
+                "status": "unknown_status",
+                "message": f"Received unknown status: {status}",
+                "ticket_id": ticket_id
+            }, status_code=400)
+
+    except Exception as e:
+        logger.exception(f"[CALLBACK] Error processing callback: {e}")
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
 
 
 ###########################################################################################################################

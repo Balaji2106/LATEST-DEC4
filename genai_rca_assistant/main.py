@@ -174,6 +174,24 @@ REMEDIABLE_ERRORS: Dict[str, Dict] = {
         "backoff_seconds": [30, 60, 120],
         "playbook_url": os.getenv("PLAYBOOK_RETRY_JOB")
     },
+    "DatabricksTimeoutError": {
+        "action": "retry_job",
+        "max_retries": 3,
+        "backoff_seconds": [60, 120, 300],  # Wait 1 min, 2 min, 5 min
+        "playbook_url": os.getenv("PLAYBOOK_RETRY_JOB")
+    },
+    "DatabricksResourceExhausted": {
+        "action": "restart_cluster",
+        "max_retries": 2,
+        "backoff_seconds": [120, 300],  # Wait 2 min, 5 min
+        "playbook_url": os.getenv("PLAYBOOK_RESTART_CLUSTER")
+    },
+    "DatabricksDriverNotResponding": {
+        "action": "restart_cluster",
+        "max_retries": 2,
+        "backoff_seconds": [60, 180],
+        "playbook_url": os.getenv("PLAYBOOK_RESTART_CLUSTER")
+    },
 
     # Conditional Remediation
     "UserErrorSourceBlobNotExists": {

@@ -2644,6 +2644,21 @@ async def remediation_callback(request: Request):
         logger.info(f"[CALLBACK] Pipeline: {pipeline_name}, Run ID: {remediation_run_id}")
         logger.info("=" * 80)
 
+        # Update remediation_attempts table with actual Databricks run_id
+        # (Logic App initially responds with a GUID, then callbacks with actual run_id)
+        if remediation_run_id and remediation_run_id != "N/A":
+            try:
+                db_execute('''UPDATE remediation_attempts
+                            SET remediation_run_id = :new_run_id
+                            WHERE ticket_id = :ticket_id
+                            AND attempt_number = :attempt_number''',
+                          {"new_run_id": str(remediation_run_id),
+                           "ticket_id": ticket_id,
+                           "attempt_number": attempt_number})
+                logger.info(f"[CALLBACK] Updated remediation_attempts with actual run_id: {remediation_run_id}")
+            except Exception as e:
+                logger.warning(f"[CALLBACK] Failed to update remediation_run_id: {e}")
+
         # Validate ticket exists
         ticket = db_query("SELECT * FROM tickets WHERE id = :id", {"id": ticket_id}, one=True)
         if not ticket:
@@ -2895,6 +2910,24 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
                 "status": "duplicate_ignored",
                 "ticket_id": existing["id"],
                 "message": f"Ticket already exists for run_id {run_id}"
+            }
+
+        # -----------------------
+        # CHECK IF THIS IS A REMEDIATION RUN (to prevent infinite loops)
+        # -----------------------
+        remediation_attempt = db_query(
+            "SELECT ticket_id FROM remediation_attempts WHERE remediation_run_id = :run_id",
+            {"run_id": str(run_id)},
+            one=True
+        )
+        if remediation_attempt:
+            original_ticket_id = remediation_attempt["ticket_id"]
+            logger.warning(f"❗ This run_id ({run_id}) is a remediation attempt for ticket {original_ticket_id}")
+            logger.info(f"🔄 Remediation run failed - will be handled by callback, not creating new ticket")
+            return {
+                "status": "remediation_run_failed",
+                "ticket_id": original_ticket_id,
+                "message": f"This is a remediation run for ticket {original_ticket_id}, handled by callback"
             }
 
     # -----------------------

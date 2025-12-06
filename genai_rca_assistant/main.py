@@ -339,7 +339,8 @@ def init_db():
             "remediation_run_id": "TEXT",
             "remediation_attempts": "INTEGER DEFAULT 0",
             "remediation_last_attempt_at": "TEXT",
-            "remediation_approval_requested_at": "TEXT"
+            "remediation_approval_requested_at": "TEXT",
+            "remediation_exhausted_at": "TEXT"
         }
         
         for col, col_type in migration_columns.items():
@@ -3014,8 +3015,23 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
     timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
     affected_entity = rca.get("affected_entity")
-    if isinstance(affected_entity, dict):
-        affected_entity = json.dumps(affected_entity)
+
+    # Ensure affected_entity includes job_id and cluster_id for Databricks tickets
+    if isinstance(affected_entity, str):
+        try:
+            affected_entity = json.loads(affected_entity)
+        except:
+            affected_entity = {}
+    elif not isinstance(affected_entity, dict):
+        affected_entity = {}
+
+    # Add job_id and cluster_id to affected_entity
+    affected_entity["job_id"] = job_id
+    affected_entity["cluster_id"] = cluster_id
+    affected_entity["job_name"] = job_name
+
+    # Convert back to JSON string for storage
+    affected_entity = json.dumps(affected_entity)
 
     ticket_data = dict(
         id=tid,
@@ -3587,14 +3603,50 @@ async def slack_interactions(request: Request):
                 error_type = ticket.get("error_type")
                 original_run_id = ticket.get("run_id")
 
-                # Trigger in background
-                asyncio.create_task(trigger_auto_remediation(
-                    ticket_id=ticket_id,
-                    pipeline_name=pipeline_name,
-                    error_type=error_type,
-                    original_run_id=original_run_id,
-                    attempt_number=1
-                ))
+                # Check if this is a Databricks ticket or ADF ticket
+                if ticket_id.startswith("DBX-"):
+                    # Databricks ticket - need to get job_id and cluster_id from ticket
+                    # Try to extract from ticket data or get from process_databricks_failure context
+                    job_id = None
+                    cluster_id = None
+
+                    # Parse job_id and cluster_id from ticket blob or affected_entity
+                    try:
+                        import json
+                        affected_entity = ticket.get("affected_entity")
+                        if affected_entity:
+                            if isinstance(affected_entity, str):
+                                entity_data = json.loads(affected_entity)
+                            else:
+                                entity_data = affected_entity
+                            job_id = entity_data.get("job_id")
+                            cluster_id = entity_data.get("cluster_id")
+                    except:
+                        pass
+
+                    # Fallback: query from Databricks webhook data stored in database
+                    # For now, we'll need to store job_id/cluster_id in tickets table
+                    # As a quick fix, extract from pipeline name or run_id context
+                    logger.info(f"[SLACK-APPROVAL] Triggering Databricks remediation for {ticket_id}")
+                    asyncio.create_task(trigger_databricks_remediation(
+                        ticket_id=ticket_id,
+                        job_name=pipeline_name,
+                        job_id=job_id,
+                        cluster_id=cluster_id,
+                        run_id=original_run_id,
+                        error_type=error_type,
+                        attempt_number=1
+                    ))
+                else:
+                    # ADF ticket - use generic auto-remediation
+                    logger.info(f"[SLACK-APPROVAL] Triggering ADF remediation for {ticket_id}")
+                    asyncio.create_task(trigger_auto_remediation(
+                        ticket_id=ticket_id,
+                        pipeline_name=pipeline_name,
+                        error_type=error_type,
+                        original_run_id=original_run_id,
+                        attempt_number=1
+                    ))
 
                 # Update Slack message
                 response_message = {

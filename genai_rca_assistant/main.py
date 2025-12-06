@@ -161,6 +161,12 @@ REMEDIABLE_ERRORS: Dict[str, Dict] = {
         "backoff_seconds": [30, 60, 120],
         "playbook_url": os.getenv("PLAYBOOK_RETRY_JOB")
     },
+    "DatabricksDriverNotResponding": {
+        "action": "retry_job",
+        "max_retries": 3,
+        "backoff_seconds": [30, 60, 120],
+        "playbook_url": os.getenv("PLAYBOOK_RETRY_JOB")
+    },
 
     # Conditional Remediation
     "UserErrorSourceBlobNotExists": {

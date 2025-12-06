@@ -2936,7 +2936,7 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
     # -----------------------
     if run_id:
         existing = db_query(
-            "SELECT id, status FROM tickets WHERE run_id = :run_id",
+            "SELECT id, status FROM tickets WHERE run_id = :run_id AND processing_mode = 'databricks'",
             {"run_id": run_id},
             one=True
         )
@@ -2948,9 +2948,34 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
                 "message": f"Ticket already exists for run_id {run_id}"
             }
 
-        # -----------------------
-        # CHECK IF THIS IS A REMEDIATION RUN (to prevent infinite loops)
-        # -----------------------
+    # -----------------------
+    # ADDITIONAL DUPLICATE CHECK: By job_name + recent timestamp (for webhooks without run_id)
+    # This prevents race condition when multiple webhooks arrive before first ticket is committed
+    # -----------------------
+    recent_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    recent_ticket = db_query(
+        '''SELECT id, status, timestamp FROM tickets
+           WHERE pipeline = :job_name
+           AND processing_mode = 'databricks'
+           AND timestamp > :cutoff
+           ORDER BY timestamp DESC
+           LIMIT 1''',
+        {"job_name": job_name, "cutoff": recent_cutoff},
+        one=True
+    )
+    if recent_ticket:
+        logger.warning(f"❗ Recent Databricks ticket found for job {job_name} within 5 minutes: {recent_ticket['id']}")
+        logger.info(f"   Existing ticket timestamp: {recent_ticket['timestamp']}")
+        return {
+            "status": "duplicate_ignored",
+            "ticket_id": recent_ticket["id"],
+            "message": f"Recent ticket already exists for job {job_name}"
+        }
+
+    # -----------------------
+    # CHECK IF THIS IS A REMEDIATION RUN (to prevent infinite loops)
+    # -----------------------
+    if run_id:
         remediation_attempt = db_query(
             "SELECT ticket_id FROM remediation_attempts WHERE remediation_run_id = :run_id",
             {"run_id": str(run_id)},
@@ -3175,24 +3200,31 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
             else:
                 # Low risk - proceed with auto-remediation
                 logger.info(f"[POLICY-ENGINE] Databricks auto-remediation approved automatically (Risk: {remediation_risk}, Impact: {business_impact})")
-                try:
-                    # For Databricks, we need to call the databricks-specific remediation Logic App
-                    # Update the trigger call to pass Databricks-specific fields
-                    asyncio.create_task(trigger_databricks_remediation(
-                        ticket_id=tid,
-                        job_name=job_name,
-                        job_id=job_id,
-                        cluster_id=cluster_id,
-                        run_id=run_id or "N/A",
-                        error_type=error_type,
-                        attempt_number=1
-                    ))
-                    log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=job_name, run_id=run_id or "N/A",
-                             details=f"Auto-remediation triggered for error_type: {error_type}, action: {remediation_action}")
-                except Exception as e:
-                    logger.error(f"[AUTO-REM] Failed to trigger Databricks auto-remediation: {e}")
-                    log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=job_name, run_id=run_id or "N/A",
-                             details=f"Error: {str(e)}")
+
+                # Validate required fields for Databricks remediation
+                if not job_id:
+                    logger.error(f"[AUTO-REM-DBX] Cannot trigger auto-remediation: job_id is missing for ticket {tid}")
+                    log_audit(ticket_id=tid, action="auto_remediation_blocked", pipeline=job_name, run_id=run_id or "N/A",
+                             details=f"job_id is required for Databricks remediation but was not available in webhook payload")
+                else:
+                    try:
+                        # For Databricks, we need to call the databricks-specific remediation Logic App
+                        # Update the trigger call to pass Databricks-specific fields
+                        asyncio.create_task(trigger_databricks_remediation(
+                            ticket_id=tid,
+                            job_name=job_name,
+                            job_id=job_id,
+                            cluster_id=cluster_id,
+                            run_id=run_id or "N/A",
+                            error_type=error_type,
+                            attempt_number=1
+                        ))
+                        log_audit(ticket_id=tid, action="auto_remediation_eligible", pipeline=job_name, run_id=run_id or "N/A",
+                                 details=f"Auto-remediation triggered for error_type: {error_type}, action: {remediation_action}, job_id: {job_id}")
+                    except Exception as e:
+                        logger.error(f"[AUTO-REM] Failed to trigger Databricks auto-remediation: {e}")
+                        log_audit(ticket_id=tid, action="auto_remediation_trigger_failed", pipeline=job_name, run_id=run_id or "N/A",
+                                 details=f"Error: {str(e)}")
         elif not is_auto_remediable:
             logger.info(f"[POLICY-ENGINE] Databricks not auto-remediable, requires manual intervention: {error_type}")
             log_audit(ticket_id=tid, action="manual_intervention_required", pipeline=job_name, run_id=run_id or "N/A",
@@ -3623,10 +3655,25 @@ async def slack_interactions(request: Request):
                     except:
                         pass
 
-                    # Fallback: query from Databricks webhook data stored in database
-                    # For now, we'll need to store job_id/cluster_id in tickets table
-                    # As a quick fix, extract from pipeline name or run_id context
-                    logger.info(f"[SLACK-APPROVAL] Triggering Databricks remediation for {ticket_id}")
+                    # Validate required fields for Databricks remediation
+                    if not job_id:
+                        logger.error(f"[SLACK-APPROVAL] Cannot trigger Databricks remediation: job_id is missing for ticket {ticket_id}")
+                        log_audit(ticket_id=ticket_id, action="approval_rejected_missing_job_id",
+                                 pipeline=pipeline_name, run_id=original_run_id, user_name=user_name,
+                                 details="job_id required for Databricks remediation but not found in ticket data")
+                        return JSONResponse({
+                            "text": f"❌ Cannot trigger remediation for {ticket_id}",
+                            "blocks": [{
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"❌ *Remediation blocked*\n\nTicket: `{ticket_id}`\nReason: job_id is required but was not found in ticket data.\nPlease manually trigger the job or contact support."
+                                }
+                            }],
+                            "replace_original": True
+                        })
+
+                    logger.info(f"[SLACK-APPROVAL] Triggering Databricks remediation for {ticket_id} with job_id={job_id}")
                     asyncio.create_task(trigger_databricks_remediation(
                         ticket_id=ticket_id,
                         job_name=pipeline_name,

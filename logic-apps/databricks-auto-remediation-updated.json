@@ -1,0 +1,625 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "manual": {
+                "type": "Request",
+                "kind": "Http",
+                "inputs": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "job_name": {
+                                "type": "string"
+                            },
+                            "job_id": {
+                                "type": ["integer", "null"]
+                            },
+                            "cluster_id": {
+                                "type": "string"
+                            },
+                            "ticket_id": {
+                                "type": "string"
+                            },
+                            "error_type": {
+                                "type": "string"
+                            },
+                            "original_run_id": {
+                                "type": "string"
+                            },
+                            "retry_attempt": {
+                                "type": "integer"
+                            },
+                            "max_retries": {
+                                "type": "integer"
+                            },
+                            "remediation_action": {
+                                "type": "string"
+                            },
+                            "callback_url": {
+                                "type": "string"
+                            },
+                            "timestamp": {
+                                "type": "string"
+                            }
+                        },
+                        "required": [
+                            "ticket_id",
+                            "remediation_action",
+                            "callback_url"
+                        ]
+                    }
+                }
+            }
+        },
+        "actions": {
+            "Initialize_status": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "remediation_run_id",
+                            "type": "string",
+                            "value": "@{guid()}"
+                        },
+                        {
+                            "name": "final_status",
+                            "type": "string",
+                            "value": "PENDING"
+                        }
+                    ]
+                },
+                "runAfter": {}
+            },
+            "Switch_on_remediation_action": {
+                "type": "Switch",
+                "expression": "@triggerBody()?['remediation_action']",
+                "default": {
+                    "actions": {
+                        "Send_Unsupported_Callback": {
+                            "type": "Http",
+                            "inputs": {
+                                "uri": "@triggerBody()?['callback_url']",
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "body": {
+                                    "ticket_id": "@triggerBody()?['ticket_id']",
+                                    "status": "Failed",
+                                    "success": false,
+                                    "error_message": "Unsupported remediation action: @{triggerBody()?['remediation_action']}",
+                                    "timestamp": "@utcNow()"
+                                }
+                            }
+                        }
+                    }
+                },
+                "cases": {
+                    "retry_job": {
+                        "actions": {
+                            "Retry_Databricks_Job": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@{parameters('databricks_workspace_url')}/api/2.1/jobs/run-now",
+                                    "method": "POST",
+                                    "headers": {
+                                        "Authorization": "Bearer @{parameters('databricks_token')}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                        "job_id": "@int(triggerBody()?['job_id'])"
+                                    }
+                                }
+                            },
+                            "Set_job_run_id": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "remediation_run_id",
+                                    "value": "@{body('Retry_Databricks_Job')?['run_id']}"
+                                },
+                                "runAfter": {
+                                    "Retry_Databricks_Job": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Monitor_Job_Until_Complete": {
+                                "type": "Until",
+                                "expression": "@or(equals(variables('final_status'), 'SUCCESS'), equals(variables('final_status'), 'FAILED'), equals(variables('final_status'), 'TERMINATED'))",
+                                "limit": {
+                                    "count": 60,
+                                    "timeout": "PT1H"
+                                },
+                                "actions": {
+                                    "Get_Job_Run_Status": {
+                                        "type": "Http",
+                                        "inputs": {
+                                            "uri": "@{parameters('databricks_workspace_url')}/api/2.1/jobs/runs/get?run_id=@{variables('remediation_run_id')}",
+                                            "method": "GET",
+                                            "headers": {
+                                                "Authorization": "Bearer @{parameters('databricks_token')}",
+                                                "Content-Type": "application/json"
+                                            }
+                                        }
+                                    },
+                                    "Parse_Job_Status": {
+                                        "type": "ParseJson",
+                                        "inputs": {
+                                            "content": "@body('Get_Job_Run_Status')",
+                                            "schema": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "state": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "life_cycle_state": {
+                                                                "type": "string"
+                                                            },
+                                                            "result_state": {
+                                                                "type": "string"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Get_Job_Run_Status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    },
+                                    "Check_If_Job_Complete": {
+                                        "type": "If",
+                                        "expression": {
+                                            "or": [
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Job_Status')?['state']?['life_cycle_state']",
+                                                        "TERMINATED"
+                                                    ]
+                                                },
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Job_Status')?['state']?['life_cycle_state']",
+                                                        "INTERNAL_ERROR"
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        "actions": {
+                                            "Set_Final_Job_Status": {
+                                                "type": "SetVariable",
+                                                "inputs": {
+                                                    "name": "final_status",
+                                                    "value": "@{body('Parse_Job_Status')?['state']?['result_state']}"
+                                                }
+                                            }
+                                        },
+                                        "else": {
+                                            "actions": {
+                                                "Wait_30_Seconds": {
+                                                    "type": "Wait",
+                                                    "inputs": {
+                                                        "interval": {
+                                                            "count": 30,
+                                                            "unit": "Second"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Parse_Job_Status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    }
+                                },
+                                "runAfter": {
+                                    "Set_job_run_id": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Send_Job_Callback": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@triggerBody()?['callback_url']",
+                                    "method": "POST",
+                                    "headers": {
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                        "ticket_id": "@triggerBody()?['ticket_id']",
+                                        "status": "@if(equals(variables('final_status'), 'SUCCESS'), 'Succeeded', 'Failed')",
+                                        "success": "@equals(variables('final_status'), 'SUCCESS')",
+                                        "attempt_number": "@triggerBody()?['retry_attempt']",
+                                        "remediation_run_id": "@variables('remediation_run_id')",
+                                        "job_name": "@triggerBody()?['job_name']",
+                                        "job_id": "@triggerBody()?['job_id']",
+                                        "error_type": "@triggerBody()?['error_type']",
+                                        "original_run_id": "@triggerBody()?['original_run_id']",
+                                        "error_message": "@if(equals(variables('final_status'), 'SUCCESS'), '', 'Databricks job failed')",
+                                        "timestamp": "@utcNow()"
+                                    }
+                                },
+                                "runAfter": {
+                                    "Monitor_Job_Until_Complete": [
+                                        "Succeeded",
+                                        "TimedOut"
+                                    ]
+                                }
+                            }
+                        },
+                        "case": "retry_job"
+                    },
+                    "restart_cluster": {
+                        "actions": {
+                            "Restart_Databricks_Cluster": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@{parameters('databricks_workspace_url')}/api/2.0/clusters/restart",
+                                    "method": "POST",
+                                    "headers": {
+                                        "Authorization": "Bearer @{parameters('databricks_token')}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                        "cluster_id": "@triggerBody()?['cluster_id']"
+                                    }
+                                }
+                            },
+                            "Set_cluster_as_run_id": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "remediation_run_id",
+                                    "value": "@{triggerBody()?['cluster_id']}"
+                                },
+                                "runAfter": {
+                                    "Restart_Databricks_Cluster": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Monitor_Cluster_Until_Running": {
+                                "type": "Until",
+                                "expression": "@or(equals(variables('final_status'), 'RUNNING'), equals(variables('final_status'), 'FAILED'))",
+                                "limit": {
+                                    "count": 40,
+                                    "timeout": "PT30M"
+                                },
+                                "actions": {
+                                    "Get_Cluster_Status": {
+                                        "type": "Http",
+                                        "inputs": {
+                                            "uri": "@{parameters('databricks_workspace_url')}/api/2.0/clusters/get?cluster_id=@{triggerBody()?['cluster_id']}",
+                                            "method": "GET",
+                                            "headers": {
+                                                "Authorization": "Bearer @{parameters('databricks_token')}",
+                                                "Content-Type": "application/json"
+                                            }
+                                        }
+                                    },
+                                    "Parse_Cluster_Status": {
+                                        "type": "ParseJson",
+                                        "inputs": {
+                                            "content": "@body('Get_Cluster_Status')",
+                                            "schema": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "state": {
+                                                        "type": "string"
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Get_Cluster_Status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    },
+                                    "Check_If_Cluster_Ready": {
+                                        "type": "If",
+                                        "expression": {
+                                            "or": [
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Cluster_Status')?['state']",
+                                                        "RUNNING"
+                                                    ]
+                                                },
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Cluster_Status')?['state']",
+                                                        "TERMINATED"
+                                                    ]
+                                                },
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Cluster_Status')?['state']",
+                                                        "ERROR"
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        "actions": {
+                                            "Set_Cluster_Final_Status": {
+                                                "type": "SetVariable",
+                                                "inputs": {
+                                                    "name": "final_status",
+                                                    "value": "@{body('Parse_Cluster_Status')?['state']}"
+                                                }
+                                            }
+                                        },
+                                        "else": {
+                                            "actions": {
+                                                "Wait_30_Seconds_Cluster": {
+                                                    "type": "Wait",
+                                                    "inputs": {
+                                                        "interval": {
+                                                            "count": 30,
+                                                            "unit": "Second"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Parse_Cluster_Status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    }
+                                },
+                                "runAfter": {
+                                    "Set_cluster_as_run_id": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Send_Cluster_Callback": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@triggerBody()?['callback_url']",
+                                    "method": "POST",
+                                    "headers": {
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                        "ticket_id": "@triggerBody()?['ticket_id']",
+                                        "status": "@if(equals(variables('final_status'), 'RUNNING'), 'Succeeded', 'Failed')",
+                                        "success": "@equals(variables('final_status'), 'RUNNING')",
+                                        "attempt_number": "@triggerBody()?['retry_attempt']",
+                                        "remediation_run_id": "@variables('remediation_run_id')",
+                                        "cluster_id": "@triggerBody()?['cluster_id']",
+                                        "error_type": "@triggerBody()?['error_type']",
+                                        "original_run_id": "@triggerBody()?['original_run_id']",
+                                        "error_message": "@if(equals(variables('final_status'), 'RUNNING'), '', 'Cluster failed to start')",
+                                        "timestamp": "@utcNow()"
+                                    }
+                                },
+                                "runAfter": {
+                                    "Monitor_Cluster_Until_Running": [
+                                        "Succeeded",
+                                        "TimedOut"
+                                    ]
+                                }
+                            }
+                        },
+                        "case": "restart_cluster"
+                    },
+                    "reinstall_libraries": {
+                        "actions": {
+                            "Restart_Cluster_For_Libraries": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@{parameters('databricks_workspace_url')}/api/2.0/clusters/restart",
+                                    "method": "POST",
+                                    "headers": {
+                                        "Authorization": "Bearer @{parameters('databricks_token')}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                        "cluster_id": "@triggerBody()?['cluster_id']"
+                                    }
+                                }
+                            },
+                            "Set_library_cluster_run_id": {
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "remediation_run_id",
+                                    "value": "@{triggerBody()?['cluster_id']}"
+                                },
+                                "runAfter": {
+                                    "Restart_Cluster_For_Libraries": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Monitor_Library_Cluster_Until_Running": {
+                                "type": "Until",
+                                "expression": "@or(equals(variables('final_status'), 'RUNNING'), equals(variables('final_status'), 'FAILED'))",
+                                "limit": {
+                                    "count": 40,
+                                    "timeout": "PT30M"
+                                },
+                                "actions": {
+                                    "Get_Library_Cluster_Status": {
+                                        "type": "Http",
+                                        "inputs": {
+                                            "uri": "@{parameters('databricks_workspace_url')}/api/2.0/clusters/get?cluster_id=@{triggerBody()?['cluster_id']}",
+                                            "method": "GET",
+                                            "headers": {
+                                                "Authorization": "Bearer @{parameters('databricks_token')}",
+                                                "Content-Type": "application/json"
+                                            }
+                                        }
+                                    },
+                                    "Parse_Library_Cluster_Status": {
+                                        "type": "ParseJson",
+                                        "inputs": {
+                                            "content": "@body('Get_Library_Cluster_Status')",
+                                            "schema": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "state": {
+                                                        "type": "string"
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Get_Library_Cluster_Status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    },
+                                    "Check_Library_Cluster_Ready": {
+                                        "type": "If",
+                                        "expression": {
+                                            "or": [
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Library_Cluster_Status')?['state']",
+                                                        "RUNNING"
+                                                    ]
+                                                },
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Library_Cluster_Status')?['state']",
+                                                        "TERMINATED"
+                                                    ]
+                                                },
+                                                {
+                                                    "equals": [
+                                                        "@body('Parse_Library_Cluster_Status')?['state']",
+                                                        "ERROR"
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        "actions": {
+                                            "Set_Library_Final_Status": {
+                                                "type": "SetVariable",
+                                                "inputs": {
+                                                    "name": "final_status",
+                                                    "value": "@{body('Parse_Library_Cluster_Status')?['state']}"
+                                                }
+                                            }
+                                        },
+                                        "else": {
+                                            "actions": {
+                                                "Wait_30_Seconds_Library": {
+                                                    "type": "Wait",
+                                                    "inputs": {
+                                                        "interval": {
+                                                            "count": 30,
+                                                            "unit": "Second"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "runAfter": {
+                                            "Parse_Library_Cluster_Status": [
+                                                "Succeeded"
+                                            ]
+                                        }
+                                    }
+                                },
+                                "runAfter": {
+                                    "Set_library_cluster_run_id": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            },
+                            "Send_Library_Callback": {
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@triggerBody()?['callback_url']",
+                                    "method": "POST",
+                                    "headers": {
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": {
+                                        "ticket_id": "@triggerBody()?['ticket_id']",
+                                        "status": "@if(equals(variables('final_status'), 'RUNNING'), 'Succeeded', 'Failed')",
+                                        "success": "@equals(variables('final_status'), 'RUNNING')",
+                                        "attempt_number": "@triggerBody()?['retry_attempt']",
+                                        "remediation_run_id": "@variables('remediation_run_id')",
+                                        "cluster_id": "@triggerBody()?['cluster_id']",
+                                        "error_type": "@triggerBody()?['error_type']",
+                                        "original_run_id": "@triggerBody()?['original_run_id']",
+                                        "error_message": "@if(equals(variables('final_status'), 'RUNNING'), '', 'Library reinstall failed')",
+                                        "timestamp": "@utcNow()"
+                                    }
+                                },
+                                "runAfter": {
+                                    "Monitor_Library_Cluster_Until_Running": [
+                                        "Succeeded",
+                                        "TimedOut"
+                                    ]
+                                }
+                            }
+                        },
+                        "case": "reinstall_libraries"
+                    }
+                },
+                "runAfter": {
+                    "Initialize_status": [
+                        "Succeeded"
+                    ]
+                }
+            },
+            "Response_with_run_id": {
+                "type": "Response",
+                "kind": "Http",
+                "inputs": {
+                    "statusCode": 200,
+                    "body": {
+                        "status": "accepted",
+                        "message": "Databricks remediation started, will monitor and callback",
+                        "run_id": "@variables('remediation_run_id')",
+                        "ticket_id": "@triggerBody()?['ticket_id']",
+                        "remediation_action": "@triggerBody()?['remediation_action']"
+                    }
+                },
+                "runAfter": {
+                    "Switch_on_remediation_action": [
+                        "Succeeded",
+                        "Failed",
+                        "Skipped"
+                    ]
+                }
+            }
+        },
+        "parameters": {
+            "databricks_workspace_url": {
+                "defaultValue": "https://adb-4063542298037379.19.azuredatabricks.net",
+                "type": "String"
+            },
+            "databricks_token": {
+                "defaultValue": "",
+                "type": "SecureString"
+            },
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "databricks_workspace_url": {
+            "value": "https://adb-4063542298037379.19.azuredatabricks.net"
+        },
+        "databricks_token": {},
+        "$connections": {
+            "type": "Object",
+            "value": {}
+        }
+    }
+}

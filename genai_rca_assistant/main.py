@@ -2670,6 +2670,11 @@ async def azure_monitor(request: Request):
         if is_auto_remediable and error_type in REMEDIABLE_ERRORS:
             logger.info(f"[POLICY-ENGINE] Eligible for auto-remediation: {error_type} for ticket {tid}")
 
+            # FORCE SLACK APPROVAL FOR ALL AUTO-REMEDIATION
+            # Override AI decision - ALL auto-remediation requires human approval for safety
+            logger.info(f"[POLICY-ENGINE] Forcing Slack approval for ADF error (AI suggested: requires_approval={requires_approval})")
+            requires_approval = True
+
             # POLICY ENGINE DECISION POINT
             if requires_approval:
                 # Risky remediation - request human approval
@@ -3161,6 +3166,11 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
 
         if is_auto_remediable and error_type in REMEDIABLE_ERRORS:
             logger.info(f"[POLICY-ENGINE] Databricks eligible for auto-remediation: {error_type} for ticket {tid}")
+
+            # FORCE SLACK APPROVAL FOR ALL DATABRICKS ERRORS
+            # Override AI decision - ALL Databricks auto-remediation requires human approval
+            logger.info(f"[POLICY-ENGINE] Forcing Slack approval for Databricks error (AI suggested: requires_approval={requires_approval})")
+            requires_approval = True
 
             # POLICY ENGINE DECISION POINT
             if requires_approval:

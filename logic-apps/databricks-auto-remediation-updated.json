@@ -14,7 +14,10 @@
                                 "type": "string"
                             },
                             "job_id": {
-                                "type": ["integer", "null"]
+                                "type": [
+                                    "integer",
+                                    "null"
+                                ]
                             },
                             "cluster_id": {
                                 "type": "string"
@@ -109,7 +112,7 @@
                                         "Content-Type": "application/json"
                                     },
                                     "body": {
-                                        "job_id": "@int(triggerBody()?['job_id'])"
+                                        "job_id": "@triggerBody()?['job_id']"
                                     }
                                 }
                             },

@@ -3612,7 +3612,6 @@ async def slack_interactions(request: Request):
 
                     # Parse job_id and cluster_id from ticket blob or affected_entity
                     try:
-                        import json
                         affected_entity = ticket.get("affected_entity")
                         if affected_entity:
                             if isinstance(affected_entity, str):

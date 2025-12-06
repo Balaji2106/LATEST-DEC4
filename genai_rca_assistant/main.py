@@ -1295,6 +1295,29 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
 
     logger.info(f"[AUTO-REM] Callback URL: {callback_url}")
 
+    # ========================================================================================================
+    # FIX FOR RACE CONDITION: Insert placeholder remediation attempt BEFORE calling Logic App
+    # This prevents the infinite loop where:
+    # 1. Logic App triggers Databricks job (new run_id assigned)
+    # 2. Job fails immediately
+    # 3. Webhook arrives BEFORE we save remediation_run_id to database
+    # 4. System creates duplicate ticket (infinite loop!)
+    # ========================================================================================================
+    pending_run_id = f"PENDING-{ticket_id}-{attempt_number}"
+    try:
+        db_execute('''INSERT INTO remediation_attempts
+                    (ticket_id, original_run_id, remediation_run_id, attempt_number,
+                     status, error_type, remediation_action, logic_app_response, started_at)
+                    VALUES (:ticket_id, :original_run_id, :remediation_run_id, :attempt_number,
+                     :status, :error_type, :remediation_action, :logic_app_response, :started_at)''',
+                 {"ticket_id": ticket_id, "original_run_id": original_run_id, "remediation_run_id": pending_run_id,
+                  "attempt_number": attempt_number, "status": "pending", "error_type": error_type,
+                  "remediation_action": remediation_config["action"], "logic_app_response": json.dumps({"status": "pending"}),
+                  "started_at": datetime.now(timezone.utc).isoformat()})
+        logger.info(f"[AUTO-REM] Pre-inserted placeholder remediation attempt: {pending_run_id}")
+    except Exception as e:
+        logger.warning(f"[AUTO-REM] Failed to insert placeholder remediation attempt: {e}")
+
     try:
         # Call Logic App
         response = _http_post_with_retries(playbook_url, payload, timeout=30, retries=3)
@@ -1303,16 +1326,16 @@ async def trigger_auto_remediation(ticket_id: str, pipeline_name: str, error_typ
             response_data = response.json()
             remediation_run_id = response_data.get("run_id", "N/A")
 
-            # Store remediation attempt
-            db_execute('''INSERT INTO remediation_attempts
-                        (ticket_id, original_run_id, remediation_run_id, attempt_number,
-                         status, error_type, remediation_action, logic_app_response, started_at)
-                        VALUES (:ticket_id, :original_run_id, :remediation_run_id, :attempt_number,
-                         :status, :error_type, :remediation_action, :logic_app_response, :started_at)''',
-                     {"ticket_id": ticket_id, "original_run_id": original_run_id, "remediation_run_id": remediation_run_id,
-                      "attempt_number": attempt_number, "status": "in_progress", "error_type": error_type,
-                      "remediation_action": remediation_config["action"], "logic_app_response": json.dumps(response_data),
-                      "started_at": datetime.now(timezone.utc).isoformat()})
+            # Update remediation attempt with actual run_id
+            db_execute('''UPDATE remediation_attempts
+                        SET remediation_run_id = :new_run_id,
+                            status = :status,
+                            logic_app_response = :response
+                        WHERE ticket_id = :ticket_id
+                        AND attempt_number = :attempt_number''',
+                     {"new_run_id": remediation_run_id, "status": "in_progress",
+                      "response": json.dumps(response_data), "ticket_id": ticket_id, "attempt_number": attempt_number})
+            logger.info(f"[AUTO-REM] Updated remediation attempt with actual run_id: {remediation_run_id}")
 
             # Update ticket
             db_execute('''UPDATE tickets
@@ -2941,6 +2964,35 @@ async def process_databricks_failure(job_name, run_id, job_id, cluster_id, error
                 "ticket_id": original_ticket_id,
                 "message": f"This is a remediation run for ticket {original_ticket_id}, handled by callback"
             }
+
+    # -----------------------
+    # ADDITIONAL CHECK: Look for recent pending/in-progress remediation attempts for same job/cluster
+    # This catches the race condition where Logic App triggered but hasn't updated run_id yet
+    # -----------------------
+    if job_id or cluster_id:
+        recent_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+        # Find tickets for this job_id or cluster_id with recent pending/in-progress remediation
+        if job_id:
+            recent_remediation = db_query('''
+                SELECT t.id, t.remediation_status, ra.status as attempt_status
+                FROM tickets t
+                LEFT JOIN remediation_attempts ra ON t.id = ra.ticket_id
+                WHERE t.pipeline = :job_name
+                AND ra.started_at > :cutoff
+                AND ra.status IN ('pending', 'in_progress')
+                ORDER BY ra.started_at DESC
+                LIMIT 1
+            ''', {"job_name": job_name, "cutoff": recent_cutoff}, one=True)
+
+            if recent_remediation:
+                logger.warning(f"⏸️ Recent remediation in progress for job {job_name}, waiting for callback")
+                logger.info(f"🔄 This appears to be a retry from ongoing remediation for ticket {recent_remediation['id']}")
+                return {
+                    "status": "remediation_in_progress",
+                    "ticket_id": recent_remediation["id"],
+                    "message": f"Remediation already in progress for this job, handled by callback"
+                }
 
     # -----------------------
     # FINOPS TAG EXTRACTION

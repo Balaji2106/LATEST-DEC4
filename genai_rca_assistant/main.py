@@ -701,13 +701,19 @@ AUTO-REMEDIATION DECISION RULES (MUST FOLLOW STRICTLY):
    - Medium: Restart operations, resource allocation changes
    - High: Data operations, multi-service dependencies
 
-5. **requires_human_approval = true** IF:
-   - remediation_risk is "High"
-   - severity is "Critical"
-   - business_impact is "Critical" or "High"
-   - Affects production financial/customer data
-   - Multiple failed remediation attempts already occurred
-   - Uncertainty in root cause (confidence is "Low")
+5. **requires_human_approval**:
+   - ALWAYS set to **true** if ANY of these conditions apply:
+     * remediation_risk is "High"
+     * severity is "Critical"
+     * business_impact is "Critical" OR "High"
+     * Affects production financial/customer data
+     * Multiple failed remediation attempts already occurred
+     * Uncertainty in root cause (confidence is "Low")
+   - Set to **false** ONLY if ALL of these are true:
+     * remediation_risk is "Low"
+     * severity is NOT "Critical"
+     * business_impact is "Low" or "Medium" (NOT High or Critical)
+     * High confidence in diagnosis
 
 6. **business_impact**:
    - Critical: Customer-facing, revenue-impacting, SLA-breach
@@ -837,13 +843,19 @@ AUTO-REMEDIATION DECISION RULES (MUST FOLLOW STRICTLY):
    - Medium: Restart operations, resource allocation changes
    - High: Data operations, multi-service dependencies
 
-5. **requires_human_approval = true** IF:
-   - remediation_risk is "High"
-   - severity is "Critical"
-   - business_impact is "Critical" or "High"
-   - Affects production financial/customer data
-   - Multiple failed remediation attempts already occurred
-   - Uncertainty in root cause (confidence is "Low")
+5. **requires_human_approval**:
+   - ALWAYS set to **true** if ANY of these conditions apply:
+     * remediation_risk is "High"
+     * severity is "Critical"
+     * business_impact is "Critical" OR "High"
+     * Affects production financial/customer data
+     * Multiple failed remediation attempts already occurred
+     * Uncertainty in root cause (confidence is "Low")
+   - Set to **false** ONLY if ALL of these are true:
+     * remediation_risk is "Low"
+     * severity is NOT "Critical"
+     * business_impact is "Low" or "Medium" (NOT High or Critical)
+     * High confidence in diagnosis
 
 6. **business_impact**:
    - Critical: Customer-facing, revenue-impacting, SLA-breach

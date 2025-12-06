@@ -1389,7 +1389,7 @@ async def trigger_databricks_remediation(ticket_id: str, job_name: str, job_id: 
 
     payload = {
         "job_name": job_name,
-        "job_id": str(job_id) if job_id else None,
+        "job_id": int(job_id) if job_id else None,
         "cluster_id": cluster_id,
         "ticket_id": ticket_id,
         "error_type": error_type,
